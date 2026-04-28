@@ -28,22 +28,35 @@
 
 ## 三、快速部署
 
-仅需 3 步即可完成部署配置：
+仅需 4 步即可完成部署配置：
 
-1.  **放文件**：将 `hawk.lua`（或 `hawk_debug.lua`）脚本及辅码表文件（如 `test5.txt`）置于 `<Rime用户目录>/lua/` 目录下。
-2.  **改 YAML**：在你的输入方案配置文件（如 `.schema.yaml`）中挂载 filter，并在 `speller/alphabet` 中补充引导键和切换键：
+1.  **放文件**：将 `aux_v2.lua`（或调试版 `aux_v2_debug.lua`）脚本及辅码表文件（如 `test5.txt`）置于 `<Rime用户目录>/lua/` 目录下。
+2.  **改 YAML**：在你的输入方案配置文件（如 `.schema.yaml`）中完成以下配置：
 
 ```yaml
 speller:
-  # 必须确保包含方案中用到的所有符号（本例中的 ; 和 `）
-  alphabet: zyxwvutsrqponmlkjihgfedcba;`
+  # 必须确保包含引导键(;)、切换键(`)和占位符(,)等所有插件使用的符号
+  alphabet: zyxwvutsrqponmlkjihgfedcba;`,
 
 engine:
   filters:
-    - lua_filter@hawk@test5@on@;@`@,@s
+    - lua_filter@aux_v2@test5@on@;@`@,@s
 ```
 
-3.  **重新部署**：在 Rime 菜单中点击重新部署即可生效。
+3.  **Hook preedit_format（双拼方案必做）**：如果你的方案 YAML 中存在 `translator/preedit_format` 字段，**必须将其更名为 `preedit_format1`**。Hawk 需要接管此参数进行拼音串的反演转换，若不改名将导致断句、修音等功能全面失效。
+
+```yaml
+translator:
+  # ❌ 原始写法（会与 Hawk 冲突）
+  # preedit_format:
+  #   - xform/.../.../
+
+  # ✅ 改名为 preedit_format1，交由 Hawk 接管
+  preedit_format1:
+    - xform/.../.../
+```
+
+4.  **重新部署**：在 Rime 菜单中点击重新部署即可生效。
 
 ## 四、配置参数详解
 
@@ -330,7 +343,7 @@ Hawk 为纯 Rime Lua 扩展环境扩展，不可脱离平台独立运行。
 
 ## 十五、日志与调试
 
-针对排障与性能监控，`hawk_debug` 版本提供了详尽的诊断体系：
+针对排障与性能监控，`aux_v2_debug` 版本提供了详尽的诊断体系：
 
 *   **结构化调试日志（Debug Log）**：修改源码首部的 `DEBUG_MODE = true` 以开启。以 JSON Lines 格式流式写入至 `<Rime用户目录>/debug_breakpoint.log`，全量记录前瞻探路逻辑与堆栈流转追踪，可结合自带的 `docs/log_parser.html` 工具进行图形化解析诊断。
 *   **普通运行日志（Dic Log）**：直接输出至 `<Rime用户目录>/dic.log`，负责记录辅码表的装填状态、`Memory` 接口初始化以及系统基底加载事件。
@@ -341,8 +354,8 @@ Hawk 为纯 Rime Lua 扩展环境扩展，不可脱离平台独立运行。
 
 ```text
 rime-hawk/
-├── hawk.lua              # 必备：核心脚本（发布版）
-├── hawk_debug.lua        # 可选：含完整诊断体系的调试版
+├── aux_v2.lua            # 必备：核心脚本（发布版）
+├── aux_v2_debug.lua      # 可选：含完整诊断体系的调试版
 ├── test5.txt             # 必备：无 BOM 头 UTF-8 的辅码文本数据
 ├── CHANGELOG.md
 ├── README.md             # 本说明文档（即此页）
@@ -356,7 +369,7 @@ rime-hawk/
 ## 十七、注意事项与已知限制
 
 1.  **`preedit_format` 冲突（致命冲突项）**  
-    如果您的输入法方案 YAML 中原先含有 `translator/preedit_format` 字段（双拼方案高发），**必须强制将其更名为 `preedit_format1`**！脚本必须夺取并接管此参数进行拼音串的反演转换，若不改名将导致脚本因无法截获正常音节而引起断句修音等功能全面越界崩溃。
+    详见部署步骤第 3 条。此项为双拼方案的必做操作，全拼方案通常无此字段可忽略。
 2.  **极短简拼断点搜寻局限**  
     受限于原生底层 Memory API 能力，使用单字母等极短的简拼特征进行查询时，可能会因命中面过宽导致引擎返回空集。这意味着在长句首字母简拼中强行切分断句可能会遭遇寻点失败。
 3.  **v2 版本架构红利宣告**  
