@@ -115,7 +115,7 @@ function AuxFilter.init(env)
         path      = "ZRM_Aux-code",
         showor    = "on",
         trigger   = ";",
-        switch    = "`",
+        ["switch"]    = "`",
         ph        = ",",
         matchmode = "s",
     }
@@ -138,7 +138,7 @@ function AuxFilter.init(env)
     AuxFilter.trigger_key_pattern = escape_pattern(cfg.trigger)
     AuxFilter.ph                  = cfg.ph
     AuxFilter.ph_pattern          = escape_pattern(cfg.ph)
-    AuxFilter.switch_key          = escape_pattern(cfg.switch)
+    AuxFilter.switch_key          = escape_pattern(cfg["switch"])
     AuxFilter.matchmode           = (cfg.matchmode == "s") and 1 or 0
     AuxFilter.show_aux_notice     = (cfg.showor ~= "off")
     logdic("基礎配置加載成功")
