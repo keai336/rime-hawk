@@ -163,6 +163,13 @@ local function table_empty(t)
     return next(t) == nil
 end
 
+-- 清空表内容但保留底层哈希桶的物理内存，减少 GC 分配
+local function clear_table(t)
+    if not t then return {} end
+    for k in pairs(t) do t[k] = nil end
+    return t
+end
+
 local function countSubstringOccurrences(str, substr)
     if not str or substr == "" then return 0 end
     local _, count = string.gsub(str, substr, "")
@@ -674,17 +681,15 @@ local function get_syllable_aux_set(syllable)
 
         for entry in AuxFilter.mem:iter_dict() do
             entry_count = entry_count + 1
-            local text = entry.text
-            if utf8len(text) == 1 then
+            -- aux_code 只存单字 key，多字词查表必返回 nil，天然跳过 utf8len
+            local codes = AuxFilter.aux_code[entry.text]
+            if codes then
                 single_char_count = single_char_count + 1
-                local codes = AuxFilter.aux_code[text]
-                if codes then
-                    has_aux_count = has_aux_count + 1
-                    if char_list then table.insert(char_list, text) end
-                    for code in codes:gmatch("[^,]+") do
-                        raw_aux_set[code] = true
-                        has_any = true
-                    end
+                has_aux_count = has_aux_count + 1
+                has_any = true
+                if char_list then table.insert(char_list, entry.text) end
+                for code in codes:gmatch("[^,]+") do
+                    raw_aux_set[code] = true
                 end
             end
         end
@@ -1506,8 +1511,8 @@ function AuxFilter.func(input, env)
     end
     local S = AuxFilter.state
     S.notifiermark = -1
-    S.yieldset = {}
-    S.yieldrawset = {}
+    S.yieldset = clear_table(S.yieldset)
+    S.yieldrawset = clear_table(S.yieldrawset)
     S.leftcompen = 0
     S.rightcompen = 0
     S.skipc = 0
