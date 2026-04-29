@@ -44,6 +44,8 @@
 speller:
   # 必须确保包含引导键(;)、切换键(`)和占位符(,)等所有插件使用的符号
   alphabet: zyxwvutsrqponmlkjihgfedcba;`,
+  # 同样强烈建议将符号加入 initials，防止 Rime 错误分词导致单辅码选字后字符残留
+  initials: zyxwvutsrqponmlkjihgfedcba;`,
 
 engine:
   filters:

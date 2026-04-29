@@ -1148,12 +1148,6 @@ function AuxFilter.func(input, env)
     local ctx = env.engine.context
     AuxFilter.Update_codes(ctx)
 
-    -- 守卫：输入仅为触发键（无前置拼音），不产出候选
-    -- 修复：未配置 speller/initials 时 ; 可独立成段，防止 fallback 透传无关候选
-    if S.inputCode:match("^" .. AuxFilter.trigger_key_pattern .. "+$") then
-        return
-    end
-
     if string.match(S.inputCode, AuxFilter.pattern_main1) then
         local composition = env.engine.context.composition
         if(not composition:empty()) then
