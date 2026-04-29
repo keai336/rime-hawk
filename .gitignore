@@ -1,0 +1,12 @@
+# 开发临时文件
+KNOWLEDGE_BASE.md
+WRITING_PROMPT.md
+CHANGELOG.md
+debug_breakpoint.log
+*.log
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*~
