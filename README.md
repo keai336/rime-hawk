@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/icon.png" alt="Rime Hawk Logo" width="128" />
+</p>
+
 # 🦅 Rime Hawk — 鹰眼辅码精准过滤插件
 
 > **一句话简介：** Hawk 是一个工作在 Rime 候选列表后处理阶段的 Lua 候选过滤器 (filter)，通过「拼音+辅码」模式实时筛选同音字，以鹰眼般的精准度实现键键有反馈的即时定位，同时提供强大的长句断句与底层修音功能。
@@ -358,6 +362,7 @@ rime-hawk/
 ├── CHANGELOG.md
 ├── README.md             # 本说明文档（即此页）
 └── docs/
+    ├── icon.png          # 项目图标
     ├── api_reference.md
     ├── data_flow.md
     ├── log_parser.html   # JSON 日志监控解析面板
