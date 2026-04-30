@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rime Debug Log Parser v2</title>
+<style>
+  :root {
+    --bg: #0d1117; --bg2: #161b22; --bg3: #21262d;
+    --fg: #c9d1d9; --fg2: #8b949e; --border: #30363d;
+    --blue: #58a6ff; --orange: #d29922; --green: #3fb950;
+    --red: #f85149; --purple: #bc8cff; --cyan: #39d2c0;
+    --diff-add: rgba(63,185,80,0.15); --diff-del: rgba(248,81,73,0.15);
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--fg); font-family:'Cascadia Code','Fira Code','JetBrains Mono',monospace; font-size:13px; }
+  
+  /* 顶栏 */
+  .toolbar { position:sticky; top:0; z-index:100; background:var(--bg2); border-bottom:1px solid var(--border); padding:8px 16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .toolbar label { color:var(--fg2); font-size:12px; }
+  .toolbar select, .toolbar input { background:var(--bg3); color:var(--fg); border:1px solid var(--border); border-radius:4px; padding:4px 8px; font-size:12px; font-family:inherit; }
+  .toolbar input[type=text] { width:200px; }
+  .toolbar button { background:var(--blue); color:#fff; border:none; border-radius:4px; padding:5px 14px; cursor:pointer; font-size:12px; font-family:inherit; }
+  .toolbar button:hover { opacity:0.85; }
+  .toolbar .stats { margin-left:auto; color:var(--fg2); font-size:11px; }
+
+  /* 拖拽区 */
+  .drop-zone { display:flex; flex-direction:column; align-items:center; justify-content:center; height:50vh; border:2px dashed var(--border); border-radius:12px; margin:40px; color:var(--fg2); transition:border-color .2s; }
+  .drop-zone.over { border-color:var(--blue); }
+  .drop-zone h2 { font-size:18px; margin-bottom:8px; }
+  .drop-zone p { font-size:12px; }
+
+  /* 主体 */
+  .main { display:none; }
+  .main.active { display:block; }
+
+  /* Session 分组 */
+  .session-group { margin:4px 0; }
+  .session-header { background:var(--bg2); padding:6px 16px; cursor:pointer; display:flex; align-items:center; gap:8px; border-left:3px solid var(--purple); font-size:12px; color:var(--purple); user-select:none; }
+  .session-header:hover { background:var(--bg3); }
+  .session-header .arrow { transition:transform .15s; }
+  .session-header.collapsed .arrow { transform:rotate(-90deg); }
+  .session-body.collapsed { display:none; }
+
+  /* 帧行 */
+  .frame { display:grid; grid-template-columns:50px 90px 80px 160px 1fr; gap:0; border-bottom:1px solid var(--border); padding:3px 0; align-items:start; cursor:pointer; transition:background .1s; }
+  .frame:hover { background:var(--bg3); }
+  .frame.selected { background:rgba(88,166,255,0.08); outline:1px solid var(--blue); outline-offset:-1px; }
+  .frame > span { padding:2px 8px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .frame .fid { color:var(--fg2); text-align:right; }
+  .frame .ts { color:var(--fg2); }
+  .frame .src-user { color:var(--blue); }
+  .frame .src-script { color:var(--orange); }
+  .frame .src-init { color:var(--fg2); }
+  .frame .evt { color:var(--cyan); }
+
+  /* Diff 面板 */
+  .detail-panel { position:fixed; right:0; top:42px; bottom:0; width:420px; background:var(--bg2); border-left:1px solid var(--border); overflow-y:auto; padding:12px; display:none; z-index:50; }
+  .detail-panel.active { display:block; }
+  .detail-panel h3 { color:var(--blue); margin-bottom:8px; font-size:13px; }
+  .detail-panel .section { margin-bottom:12px; }
+  .detail-panel .section-title { color:var(--fg2); font-size:11px; text-transform:uppercase; margin-bottom:4px; letter-spacing:1px; }
+  .diff-row { display:flex; gap:4px; padding:2px 4px; font-size:12px; border-radius:3px; margin:1px 0; }
+  .diff-row.added { background:var(--diff-add); }
+  .diff-row.removed { background:var(--diff-del); }
+  .diff-row.unchanged { color:var(--fg2); }
+  .diff-key { color:var(--purple); min-width:120px; }
+  .diff-arrow { color:var(--fg2); }
+  .diff-old { color:var(--red); text-decoration:line-through; }
+  .diff-new { color:var(--green); }
+  .diff-val { color:var(--fg); }
+  .raw-json { background:var(--bg); padding:8px; border-radius:4px; font-size:11px; white-space:pre-wrap; word-break:break-all; max-height:300px; overflow-y:auto; color:var(--fg2); margin-top:8px; }
+
+  /* 帮助提示 */
+  .help { position:fixed; bottom:8px; left:16px; color:var(--fg2); font-size:11px; z-index:100; }
+
+  /* 主体有侧栏时收窄 */
+  .main.has-panel .frame-list { margin-right:420px; }
+</style>
+</head>
+<body>
+
+<div class="drop-zone" id="dropZone">
+  <h2>📋 拖拽 debug_breakpoint.log 到此处</h2>
+  <p>或点击下方按钮选择文件 · 也可直接粘贴 JSONL 文本 (Ctrl+V)</p>
+  <div style="margin-top:16px; display:flex; gap:10px;">
+    <button onclick="fileInput.click()">选择文件</button>
+    <button onclick="loadDemo()">加载示例</button>
+  </div>
+  <input type="file" id="fileInput" accept=".log,.jsonl,.txt" style="display:none">
+</div>
+
+<div class="toolbar" id="toolbar" style="display:none">
+  <label>级别: <select id="levelFilter">
+    <option value="0">全部</option>
+    <option value="1">≥ FRAME (1)</option>
+    <option value="2">≥ DETAIL (2)</option>
+    <option value="3">≥ TRACE (3)</option>
+  </select></label>
+  <label>触发源: <select id="srcFilter">
+    <option value="">全部</option>
+    <option value="USER_TYPING">USER_TYPING</option>
+    <option value="SCRIPT">SCRIPT:*</option>
+    <option value="INIT">INIT</option>
+  </select></label>
+  <label>事件: <input type="text" id="evtFilter" placeholder="过滤 event 名..."></label>
+  <label>Session: <select id="sessionFilter"><option value="">全部</option></select></label>
+  <label>Round: <select id="roundFilter"><option value="">全部</option></select></label>
+  <label><input type="checkbox" id="diffToggle" checked> 自动Diff</label>
+  <button onclick="resetView()">重置</button>
+  <span class="stats" id="stats"></span>
+</div>
+
+<div class="main" id="mainView">
+  <div class="frame-list" id="frameList"></div>
+</div>
+
+<div class="detail-panel" id="detailPanel">
+  <h3 id="detailTitle">帧详情</h3>
+  <div id="detailContent"></div>
+</div>
+
+<div class="help" id="helpBar" style="display:none">
+  ← → 逐帧步进 · Esc 关闭侧栏 · 点击帧行查看详情与 Diff
+</div>
+
+<script>
+// ============ 数据层 ============
+let allFrames = [];
+let filteredFrames = [];
+let selectedIdx = -1;
+
+// ============ 解析 ============
+function parseJSONL(text) {
+  const lines = text.split('\n');
+  const frames = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try { frames.push(JSON.parse(trimmed)); }
+    catch(e) { /* 跳过损坏行 */ }
+  }
+  return frames;
+}
+
+// 推断日志级别(旧格式无 level 字段时的兼容)
+function inferLevel(f) {
+  const evt = f.event || '';
+  if (evt.includes('_start') || evt.includes('_end') || evt === 'func_dispatch' || evt === 'session_start') return 1;
+  if (evt.includes('_loop') || evt.includes('cache_hit') || evt.includes('dict_lookup') || evt.includes('iter_dict') || evt.includes('predictive') || evt.includes('fallback')) return 3;
+  return 2;
+}
+
+// ============ 渲染 ============
+function loadData(text) {
+  allFrames = parseJSONL(text);
+  if (allFrames.length === 0) { alert('未解析到有效的 JSONL 数据'); return; }
+  
+  // 兼容旧格式字段名映射
+  allFrames.forEach((f, i) => {
+    f._idx = i;
+    if (!f.fid) f.fid = i + 1;
+    if (!f.sid && f.session) f.sid = f.session;
+    if (!f.ts && f.timestamp) f.ts = f.timestamp;
+    if (!f.src) f.src = 'UNKNOWN';
+    f._level = f.log_level || inferLevel(f);
+  });
+
+  // 填充 session 下拉
+  const sessions = [...new Set(allFrames.map(f => f.sid).filter(Boolean))];
+  const sel = document.getElementById('sessionFilter');
+  sel.innerHTML = '<option value="">全部</option>' + sessions.map(s => `<option value="${s}">${s}</option>`).join('');
+
+  // 填充 round 下拉
+  const rounds = [...new Set(allFrames.map(f => f.round).filter(r => r != null))];
+  const rsel = document.getElementById('roundFilter');
+  rsel.innerHTML = '<option value="">全部</option>' + rounds.map(r => `<option value="${r}">Round #${r}</option>`).join('');
+
+  document.getElementById('dropZone').style.display = 'none';
+  document.getElementById('toolbar').style.display = 'flex';
+  document.getElementById('mainView').classList.add('active');
+  document.getElementById('helpBar').style.display = 'block';
+  
+  applyFilters();
+}
+
+function applyFilters() {
+  const level = parseInt(document.getElementById('levelFilter').value);
+  const src = document.getElementById('srcFilter').value;
+  const evt = document.getElementById('evtFilter').value.toLowerCase();
+  const sid = document.getElementById('sessionFilter').value;
+  const rid = document.getElementById('roundFilter').value;
+
+  filteredFrames = allFrames.filter(f => {
+    if (level > 0 && f._level > level) return false;
+    if (src === 'USER_TYPING' && f.src !== 'USER_TYPING') return false;
+    if (src === 'SCRIPT' && !(f.src || '').startsWith('SCRIPT')) return false;
+    if (src === 'INIT' && f.src !== 'INIT') return false;
+    if (evt && !(f.event || '').toLowerCase().includes(evt)) return false;
+    if (sid && f.sid !== sid) return false;
+    if (rid && String(f.round) !== rid) return false;
+    return true;
+  });
+
+  renderFrameList();
+  document.getElementById('stats').textContent = `${filteredFrames.length} / ${allFrames.length} 帧`;
+  selectedIdx = -1;
+  closePanel();
+}
+
+function renderFrameList() {
+  const container = document.getElementById('frameList');
+  // 按 session → round 双层分组
+  const sessionGroups = new Map();
+  filteredFrames.forEach(f => {
+    const sid = f.sid || 'unknown';
+    if (!sessionGroups.has(sid)) sessionGroups.set(sid, new Map());
+    const roundGroups = sessionGroups.get(sid);
+    const rid = f.round != null ? f.round : 0;
+    if (!roundGroups.has(rid)) roundGroups.set(rid, []);
+    roundGroups.get(rid).push(f);
+  });
+
+  let html = '';
+  for (const [sid, roundGroups] of sessionGroups) {
+    html += `<div class="session-group">`;
+    html += `<div class="session-header" onclick="toggleSession(this)"><span class="arrow">▼</span> Session: ${esc(sid)} (${[...roundGroups.values()].reduce((a,b)=>a+b.length,0)} 帧, ${roundGroups.size} 轮)</div>`;
+    html += `<div class="session-body">`;
+    for (const [rid, frames] of roundGroups) {
+      const firstSrc = frames[0]?.src || '';
+      const firstInput = frames[0]?.inputCode || '';
+      const srcTag = firstSrc.startsWith('SCRIPT') ? `<span style="color:var(--orange)">${esc(firstSrc)}</span>` : `<span style="color:var(--blue)">USER</span>`;
+      html += `<div style="padding:2px 16px 2px 24px;font-size:11px;color:var(--fg2);cursor:pointer;border-left:2px solid var(--bg3)" onclick="this.nextElementSibling.classList.toggle('collapsed')">`;
+      html += `▸ Round #${rid} ${srcTag} input="${esc(firstInput)}" (${frames.length} 帧)</div>`;
+      html += `<div>`;
+      for (const f of frames) {
+        const srcClass = (f.src || '').startsWith('SCRIPT') ? 'src-script' : f.src === 'USER_TYPING' ? 'src-user' : 'src-init';
+        html += `<div class="frame" data-idx="${f._idx}" onclick="selectFrame(${f._idx})">`;
+        html += `<span class="fid">#${f.fid}</span>`;
+        html += `<span class="ts">${esc(f.ts || '')}</span>`;
+        html += `<span class="${srcClass}">${esc(f.src || '')}</span>`;
+        html += `<span class="evt">${esc(f.event || '')}</span>`;
+        html += `<span style="color:var(--fg2)">${summaryText(f)}</span>`;
+        html += `</div>`;
+      }
+      html += `</div>`;
+    }
+    html += `</div></div>`;
+  }
+  container.innerHTML = html;
+}
+
+function summaryText(f) {
+  const parts = [];
+  if (f.round != null) parts.push('R' + f.round);
+  if (f.notifier) parts.push(f.notifier);
+  if (f.action) parts.push(f.action);
+  if (f.step) parts.push(f.step);
+  if (f.inputCode) parts.push('input=' + f.inputCode);
+  if (f.syllable) parts.push('syl=' + f.syllable);
+  if (f.branch) parts.push(f.branch);
+  if (f.status) parts.push(f.status);
+  if (f.matched !== undefined) parts.push(f.matched ? '✓' : '✗');
+  if (f.will_commit !== undefined) parts.push(f.will_commit ? 'COMMIT' : 'REENTER');
+  return parts.join(' · ');
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ============ Session 折叠 ============
+function toggleSession(el) {
+  el.classList.toggle('collapsed');
+  el.nextElementSibling.classList.toggle('collapsed');
+}
+
+// ============ 帧选择与 Diff ============
+function selectFrame(idx) {
+  // 清除旧选中
+  document.querySelectorAll('.frame.selected').forEach(el => el.classList.remove('selected'));
+  
+  selectedIdx = idx;
+  const el = document.querySelector(`.frame[data-idx="${idx}"]`);
+  if (el) { el.classList.add('selected'); el.scrollIntoView({block:'nearest'}); }
+
+  const f = allFrames[idx];
+  const panel = document.getElementById('detailPanel');
+  const content = document.getElementById('detailContent');
+  document.getElementById('detailTitle').textContent = `#${f.fid} · ${f.event || ''}`;
+  document.getElementById('mainView').classList.add('has-panel');
+
+  let html = '';
+
+  // 触发源标签
+  const srcColor = (f.src||'').startsWith('SCRIPT') ? 'var(--orange)' : f.src === 'USER_TYPING' ? 'var(--blue)' : 'var(--fg2)';
+  html += `<div style="margin-bottom:8px"><span style="background:${srcColor};color:#000;padding:2px 8px;border-radius:3px;font-size:11px">${esc(f.src||'')}</span></div>`;
+
+  // 自动 Diff
+  if (document.getElementById('diffToggle').checked && idx > 0) {
+    const prev = allFrames[idx - 1];
+    html += renderDiff(prev, f);
+  }
+
+  // 原始 JSON
+  const rawCopy = Object.assign({}, f);
+  delete rawCopy._idx; delete rawCopy._level;
+  html += `<div class="section"><div class="section-title">原始 JSON</div><div class="raw-json">${esc(JSON.stringify(rawCopy, null, 2))}</div></div>`;
+
+  content.innerHTML = html;
+  panel.classList.add('active');
+}
+
+function renderDiff(prev, curr) {
+  // 收集所有 key（排除内部标记）
+  const skip = new Set(['_idx','_level','fid','sid','ts','src','session','timestamp','round','log_level']);
+  const allKeys = new Set();
+  for (const k of Object.keys(prev)) if (!skip.has(k)) allKeys.add(k);
+  for (const k of Object.keys(curr)) if (!skip.has(k)) allKeys.add(k);
+
+  const changed = [], added = [], removed = [], same = [];
+  for (const k of [...allKeys].sort()) {
+    const pv = prev[k], cv = curr[k];
+    const ps = JSON.stringify(pv), cs = JSON.stringify(cv);
+    if (pv === undefined) added.push({k, v: cv});
+    else if (cv === undefined) removed.push({k, v: pv});
+    else if (ps !== cs) changed.push({k, old: pv, new_: cv});
+    else same.push({k, v: cv});
+  }
+
+  if (changed.length === 0 && added.length === 0 && removed.length === 0) {
+    return `<div class="section"><div class="section-title">Diff vs #${prev.fid}</div><div style="color:var(--fg2);font-size:12px;padding:4px">无变化</div></div>`;
+  }
+
+  let html = `<div class="section"><div class="section-title">Diff vs #${prev.fid} (${changed.length} 变 · ${added.length} 新 · ${removed.length} 删)</div>`;
+  
+  for (const c of changed) {
+    html += `<div class="diff-row added"><span class="diff-key">${esc(c.k)}</span><span class="diff-old">${esc(JSON.stringify(c.old))}</span><span class="diff-arrow"> → </span><span class="diff-new">${esc(JSON.stringify(c.new_))}</span></div>`;
+  }
+  for (const a of added) {
+    html += `<div class="diff-row added"><span class="diff-key">+ ${esc(a.k)}</span><span class="diff-new">${esc(JSON.stringify(a.v))}</span></div>`;
+  }
+  for (const r of removed) {
+    html += `<div class="diff-row removed"><span class="diff-key">- ${esc(r.k)}</span><span class="diff-old">${esc(JSON.stringify(r.v))}</span></div>`;
+  }
+
+  // 折叠未变化字段
+  if (same.length > 0) {
+    html += `<details style="margin-top:4px"><summary style="color:var(--fg2);font-size:11px;cursor:pointer">${same.length} 个未变化字段</summary>`;
+    for (const s of same) {
+      html += `<div class="diff-row unchanged"><span class="diff-key">${esc(s.k)}</span><span class="diff-val">${esc(JSON.stringify(s.v))}</span></div>`;
+    }
+    html += `</details>`;
+  }
+
+  // state 对象专属 Diff
+  if (curr.state && typeof curr.state === 'object') {
+    const prevState = (prev.state && typeof prev.state === 'object') ? prev.state : {};
+    const stateKeys = new Set([...Object.keys(prevState), ...Object.keys(curr.state)]);
+    const sc = [], sa = [], sr = [], ss = [];
+    for (const k of [...stateKeys].sort()) {
+      const pv = prevState[k], cv = curr.state[k];
+      const ps = JSON.stringify(pv), cs = JSON.stringify(cv);
+      if (pv === undefined) sa.push({k, v: cv});
+      else if (cv === undefined) sr.push({k, v: pv});
+      else if (ps !== cs) sc.push({k, old: pv, new_: cv});
+      else ss.push({k, v: cv});
+    }
+    if (sc.length > 0 || sa.length > 0 || sr.length > 0) {
+      html += `<div class="section"><div class="section-title">State Diff (${sc.length} 变)</div>`;
+      for (const c of sc) {
+        html += `<div class="diff-row added"><span class="diff-key">${esc(c.k)}</span><span class="diff-old">${esc(JSON.stringify(c.old))}</span><span class="diff-arrow"> → </span><span class="diff-new">${esc(JSON.stringify(c.new_))}</span></div>`;
+      }
+      for (const a of sa) {
+        html += `<div class="diff-row added"><span class="diff-key">+ ${esc(a.k)}</span><span class="diff-new">${esc(JSON.stringify(a.v))}</span></div>`;
+      }
+      if (ss.length > 0) {
+        html += `<details style="margin-top:4px"><summary style="color:var(--fg2);font-size:11px;cursor:pointer">${ss.length} 个未变化 state 字段</summary>`;
+        for (const s of ss) {
+          html += `<div class="diff-row unchanged"><span class="diff-key">${esc(s.k)}</span><span class="diff-val">${esc(JSON.stringify(s.v))}</span></div>`;
+        }
+        html += `</details>`;
+      }
+      html += `</div>`;
+    }
+  }
+
+  html += `</div>`;
+  return html;
+}
+
+function closePanel() {
+  document.getElementById('detailPanel').classList.remove('active');
+  document.getElementById('mainView').classList.remove('has-panel');
+  document.querySelectorAll('.frame.selected').forEach(el => el.classList.remove('selected'));
+}
+
+function resetView() {
+  document.getElementById('levelFilter').value = '0';
+  document.getElementById('srcFilter').value = '';
+  document.getElementById('evtFilter').value = '';
+  document.getElementById('sessionFilter').value = '';
+  applyFilters();
+}
+
+// ============ 键盘步进 ============
+document.addEventListener('keydown', e => {
+  if (allFrames.length === 0) return;
+  if (e.key === 'Escape') { closePanel(); return; }
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+    e.preventDefault();
+    const nextIdx = selectedIdx < 0 ? (filteredFrames[0]?._idx ?? 0) : findNextFiltered(selectedIdx, 1);
+    if (nextIdx !== null) selectFrame(nextIdx);
+  }
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (selectedIdx >= 0) {
+      const prevIdx = findNextFiltered(selectedIdx, -1);
+      if (prevIdx !== null) selectFrame(prevIdx);
+    }
+  }
+});
+
+function findNextFiltered(currentIdx, dir) {
+  const pos = filteredFrames.findIndex(f => f._idx === currentIdx);
+  if (pos < 0) return filteredFrames[0]?._idx ?? null;
+  const next = pos + dir;
+  if (next < 0 || next >= filteredFrames.length) return null;
+  return filteredFrames[next]._idx;
+}
+
+// ============ 文件加载 ============
+const dropZone = document.getElementById('dropZone');
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault(); dropZone.classList.remove('over');
+  const file = e.dataTransfer.files[0];
+  if (file) readFile(file);
+});
+
+document.getElementById('fileInput').addEventListener('change', e => {
+  if (e.target.files[0]) readFile(e.target.files[0]);
+});
+
+// 粘贴支持
+document.addEventListener('paste', e => {
+  if (allFrames.length > 0) return; // 已加载数据时不响应粘贴
+  const text = (e.clipboardData || window.clipboardData).getData('text');
+  if (text && text.trim().startsWith('{')) loadData(text);
+});
+
+function readFile(file) {
+  const reader = new FileReader();
+  reader.onload = e => loadData(e.target.result);
+  reader.readAsText(file);
+}
+
+// 筛选器变化事件
+['levelFilter','srcFilter','evtFilter','sessionFilter','roundFilter','diffToggle'].forEach(id => {
+  document.getElementById(id).addEventListener('change', applyFilters);
+});
+document.getElementById('evtFilter').addEventListener('input', applyFilters);
+
+// 示例数据
+function loadDemo() {
+  const demo = [
+    '{"fid":1,"sid":"20260430_083600_1234","ts":"08:36:00.001","src":"USER_TYPING","round":0,"event":"session_start","version":"v2_debug","log_level":1}',
+    '{"fid":2,"sid":"20260430_083600_1234","ts":"08:36:05.123","src":"USER_TYPING","round":1,"event":"func_dispatch","inputCode":"lo","precode":"lo‸","log_level":1,"state":{"counter":0,"auxStr":"","single_flag":false,"distraction":false}}',
+    '{"fid":3,"sid":"20260430_083600_1234","ts":"08:36:05.456","src":"USER_TYPING","round":2,"event":"func_dispatch","inputCode":"lo;q","precode":"lo;q‸","log_level":1,"state":{"counter":0,"auxStr":"q","single_flag":false,"distraction":false}}',
+    '{"fid":4,"sid":"20260430_083600_1234","ts":"08:36:05.457","src":"USER_TYPING","round":2,"event":"parse_input_code","auxcode":"q","funccode":"","log_level":2}',
+    '{"fid":5,"sid":"20260430_083600_1234","ts":"08:36:06.100","src":"USER_TYPING","round":3,"event":"func_dispatch","inputCode":"loq;vv;","branch":"longcandimodify","log_level":1,"state":{"counter":0,"auxStr":"","single_flag":false,"distraction":false}}',
+    '{"fid":6,"sid":"20260430_083600_1234","ts":"08:36:06.101","src":"USER_TYPING","round":3,"event":"longcandimodify_start","inputCode":"loq;vv;","log_level":1}',
+    '{"fid":7,"sid":"20260430_083600_1234","ts":"08:36:06.102","src":"USER_TYPING","round":3,"event":"get_first_candidate","step":"found","cand_text":"洛奇","cand_type":"phrase","ftext":"洛奇","log_level":2}',
+    '{"fid":8,"sid":"20260430_083600_1234","ts":"08:36:06.103","src":"USER_TYPING","round":3,"event":"longcandimodify_end","status":"completed","log_level":1}',
+    '{"fid":9,"sid":"20260430_083600_1234","ts":"08:36:06.200","src":"SCRIPT:longcandi_restore_aux","round":3,"event":"notifier_fired","notifier":"longcandimodify","action":"restore_aux","will_commit":false,"log_level":1,"state":{"counter":1,"auxStr":"vv","single_flag":false,"distraction":false,"removeAuxInput":"loq"}}',
+    '{"fid":10,"sid":"20260430_083600_1234","ts":"08:36:06.201","src":"SCRIPT:longcandi_restore_aux","round":4,"event":"func_dispatch","inputCode":"q;vv","log_level":1,"state":{"counter":0,"auxStr":"vv","single_flag":false,"distraction":false}}',
+  ].join('\n');
+  loadData(demo);
+}
+</script>
+</body>
+</html>

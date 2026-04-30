@@ -204,6 +204,7 @@ function AuxFilter.init(env)
             AuxFilter.state.one_aux_firstcode = nil
             AuxFilter.state.aux_left = nil
             AuxFilter.state.transedtext = nil
+            AuxFilter.good_precode_cache = {} -- 组字结束，清空时空缓存
         end
     end)
     env.notifier = engine.context.select_notifier:connect(function(ctx)
@@ -227,7 +228,10 @@ function AuxFilter.main1_notifier(ctx)
         return
     end
     AuxFilter.Update_codes(ctx)
-    if S.removetransdInput ~= "" then
+    -- 泄漏检测：removetransdInput 恰好等于单辅码本身，说明是 Rime 引擎
+    -- 将辅码字母当作独立段翻译后泄漏出来的，不是真实的剩余拼音
+    local leaked_aux = (S.aux_left == nil and S.auxStr ~= "" and S.removetransdInput == S.auxStr)
+    if S.removetransdInput ~= "" and not leaked_aux then
         S.last_fist_commit = nil  -- 隐式输入轮，不继承去重状态
         S.aux_left = S.aux_left or ""
         ctx.input = S.removeAuxInput .. AuxFilter.trigger_key .. S.aux_left
@@ -511,9 +515,31 @@ function AuxFilter.yield_candisub(cand)
         end
     end
     local cand = finalcandi.cand
+    
+    -- ==========================================
+    -- 🚀 FIX: 拦截纯由辅码/功能码段产生的垃圾候选
+    -- 当引擎吞噬引导键时，尾部的功能码（如 t）会被引擎当作拼音翻译产生候选（如 "他" 或 "图"）。
+    -- 这些候选的 _start 必然在 removeAuxInput 的长度之后，直接果断丢弃！
+    -- ==========================================
+    if S.removeAuxInput and cand._start >= #S.removeAuxInput then
+        return
+    end
+
     local candtext = cand.text
     if S.counter == 1 and (S.dupc ~= 1 or S.transor or S.rawor) then
-        candtext = S.transdcode:gsub("‸","") .. cand.text
+        -- ==========================================
+        -- 🚀 FIX: 修复 transdcode 拼接导致的文本翻倍 BUG
+        -- 当预编辑包含已翻译的中文时，transdcode 已经包含了该中文。
+        -- 若直接与 cand.text 拼接，会导致 "韩信带净化" + "韩信带净化" = "韩信带净化韩信带净化"
+        -- ==========================================
+        local prefix = S.transdcode:gsub("‸","")
+        if cand._start == 0 then
+            prefix = "" -- 候选覆盖全局，不需要前缀
+        elseif candtext ~= "" and prefix:sub(-#candtext) == candtext then
+            prefix = prefix:sub(1, -#candtext - 1) -- 去除重复的后缀
+        end
+        candtext = prefix .. candtext
+        
         if S.dupc ~= 1 then
             candtext = string.rep(candtext, S.dupc)
             cand.comment = "复制" .. tostring(S.dupc) .. "次"
@@ -1081,8 +1107,47 @@ function AuxFilter.Update_codes(ctx)
     S.inputCode = transform_input_code(S.inputCode)
     S.precode = context:get_preedit().text
     S.precode = transform_input_code(S.precode)
+
+    local tkp = AuxFilter.trigger_key
+    local tkp_pat = AuxFilter.trigger_key_pattern
+
     S.removeAuxInput = S.inputCode:match(AuxFilter.pattern_removeAux) or ""
-    S.removeAuxprecode = S.precode:match(AuxFilter.pattern_removeAux) or ""
+    local raw_removeAuxprecode = S.precode:match(AuxFilter.pattern_removeAux) or ""
+
+    -- ==========================================
+    -- 🚀 时空缓存防吞噬机制（主防线）
+    -- 当 precode 健康（含引导键）时缓存正确的 removeAuxprecode。
+    -- 当引擎吞噬引导键导致 precode 被污染时，从缓存回档纯净值。
+    -- 一次清洗，所有下游变量（removetransdInput/transdcode/transdcodei）自动纯净。
+    -- ==========================================
+    AuxFilter.good_precode_cache = AuxFilter.good_precode_cache or {}
+
+    if S.precode:find(tkp, 1, true) then
+        -- precode 健康：引导键存在，提取结果可信，存入缓存
+        AuxFilter.good_precode_cache[S.inputCode] = raw_removeAuxprecode
+        S.removeAuxprecode = raw_removeAuxprecode
+    elseif S.inputCode:find(tkp, 1, true) then
+        -- 引擎吞噬了引导键：precode 已被污染
+        if AuxFilter.good_precode_cache[S.inputCode] then
+            -- 缓存命中：从保险箱回档纯净值
+            S.removeAuxprecode = AuxFilter.good_precode_cache[S.inputCode]
+        else
+            -- 缓存未命中（兜底）：启发式剥离尾部辅码残骸
+            S.removeAuxprecode = raw_removeAuxprecode
+            local aux_part = S.inputCode:match(tkp_pat .. "(.*)$") or ""
+            if aux_part ~= "" then
+                local trailing = S.removeAuxprecode:match("(%a+)‸?$") or ""
+                if trailing ~= "" and aux_part:sub(-#trailing) == trailing then
+                    S.removeAuxprecode = S.removeAuxprecode:gsub(trailing .. "(‸?)$", "%1")
+                end
+            end
+        end
+    else
+        -- 无引导键：普通输入，直接使用
+        S.removeAuxprecode = raw_removeAuxprecode
+    end
+    -- ==========================================
+
     S.removetransdInput = S.removeAuxprecode:match(AuxFilter.pattern_removetransd) or ""
     local pos1 = S.removeAuxprecode:find(S.removetransdInput, 1, true)
     if pos1 and S.removetransdInput ~= "" then

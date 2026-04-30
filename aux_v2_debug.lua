@@ -41,12 +41,16 @@ local AuxFilter = {}
 -- 调试日志开关 (设为 false 关闭日志输出)
 -- ============================================
 local DEBUG_MODE = true
+local LOG_LEVEL = 2  -- 1=FRAME(轮次边界), 2=DETAIL(分支决策), 3=TRACE(逐音节循环)
+local round_counter = 0  -- 全局轮次序号
+local next_trigger_source = nil  -- 染色预告标记
 
 -- ============================================
 -- 调试日志系统
 -- ============================================
 local debugLogPath = DEBUG_MODE and rime_api.get_user_data_dir() .. "/debug_breakpoint.log" or nil
 local debugfile = debugLogPath and io.open(debugLogPath, "a") or nil
+if debugfile then debugfile:setvbuf("line") end  -- 行缓冲：每行自动 flush
 
 local session_id = DEBUG_MODE and os.date("%Y%m%d_%H%M%S_") .. tostring(math.random(1000, 9999)) or nil
 
@@ -90,24 +94,61 @@ local function table_to_json(t)
     end
 end
 
-local function debug_log(data)
+local frame_counter = 0  -- 全局帧序号（绝对因果时序）
+
+local function debug_log(data, level)
+    level = level or 2
     if not DEBUG_MODE or not debugfile then return end
-    data.session = session_id
-    data.timestamp = os.date("%Y-%m-%d %H:%M:%S")
+    if level > LOG_LEVEL then return end
+    frame_counter = frame_counter + 1
+    data.fid = frame_counter
+    data.sid = session_id
+    local ms = math.floor(os.clock() * 1000 % 1000)
+    data.ts = os.date("%H:%M:%S") .. string.format(".%03d", ms)
+    data.round = round_counter
+    data.src = next_trigger_source or "USER_TYPING"
+    data.log_level = level
     local json_str = table_to_json(data)
     debugfile:write(json_str .. "\n")
-    debugfile:flush()
+end
+
+local function snapshot_state()
+    local S = AuxFilter.state
+    if not S then return nil end
+    return {
+        single_flag       = S.single_flag,
+        turned            = S.turned,
+        distraction       = S.distraction,
+        notifiermark      = S.notifiermark,
+        counter           = S.counter,
+        auxStr            = S.auxStr,
+        funccode          = S.funccode,
+        leftcompen        = S.leftcompen,
+        rightcompen       = S.rightcompen,
+        skipc             = S.skipc,
+        dupc              = S.dupc,
+        ficompensate      = S.ficompensate,
+        prelen            = S.prelen,
+        inputCode         = S.inputCode,
+        precode           = S.precode,
+        removeAuxInput    = S.removeAuxInput,
+        removetransdInput = S.removetransdInput,
+        transdcode        = S.transdcode,
+        aux_left          = S.aux_left,
+        one_aux_firstcode = S.one_aux_firstcode,
+        ftext             = S.ftext,
+        transor           = S.transor,
+        rawor             = S.rawor,
+    }
 end
 
 local function start_debug_session()
     if not DEBUG_MODE then return end
-    if DEBUG_MODE then
     debug_log({
         event = "session_start",
         version = "v2_debug",
-        fix_description = "修复修音分支 inputspls 缓存污染崩溃"
-    })
-    end
+        description = "渐进式Debug增强：轮次追踪+触发源染色+S表快照+日志分级"
+    }, 1)
 end
 
 start_debug_session()
@@ -257,14 +298,14 @@ function AuxFilter.init(env)
             AuxFilter.longcandimodify_flag = true
             logdic("Memory 初始化成功")
             if DEBUG_MODE then
-                debug_log({event = "memory_init", status = "success"})
+                debug_log({event = "memory_init", status = "success"}, 1)
             end
         else
             AuxFilter.mem = nil
             AuxFilter.longcandimodify_flag = false
             logdic("Memory 初始化失败，断句功能不可用")
             if DEBUG_MODE then
-                debug_log({event = "memory_init", status = "failed"})
+                debug_log({event = "memory_init", status = "failed"}, 1)
             end
         end
     end
@@ -296,6 +337,7 @@ function AuxFilter.init(env)
             AuxFilter.state.one_aux_firstcode = nil
             AuxFilter.state.aux_left = nil
             AuxFilter.state.transedtext = nil
+            AuxFilter.good_precode_cache = {} -- 组字结束，清空时空缓存
         end
     end)
     env.notifier = engine.context.select_notifier:connect(function(ctx)
@@ -313,12 +355,39 @@ end
 function AuxFilter.main1_notifier(ctx)
     local S = AuxFilter.state
     if S.transedtext ~= nil then
+        next_trigger_source = "SCRIPT:main1_commit_transed"
+        if DEBUG_MODE then
+            debug_log({
+                event = "notifier_fired",
+                notifier = "main1",
+                action = "commit_transed",
+                transedtext = S.transedtext,
+                state = snapshot_state(),
+            }, 1)
+        end
         AuxFilter.env.engine:commit_text(S.transedtext)
         S.transedtext = nil
         ctx:clear()
         return
     end
     AuxFilter.Update_codes(ctx)
+    -- 泄漏检测：removetransdInput 恰好等于单辅码本身，说明是 Rime 引擎
+    -- 将辅码字母当作独立段翻译后泄漏出来的，不是真实的剩余拼音
+    local leaked_aux = (S.aux_left == nil and S.auxStr ~= "" and S.removetransdInput == S.auxStr)
+    local will_commit = (S.removetransdInput == "" or leaked_aux)
+    next_trigger_source = will_commit and "SCRIPT:main1_commit" or "SCRIPT:main1_restore_aux"
+    if DEBUG_MODE then
+        debug_log({
+            event = "notifier_fired",
+            notifier = "main1",
+            action = will_commit and "commit" or "restore_aux",
+            removetransdInput = S.removetransdInput,
+            removeAuxInput = S.removeAuxInput,
+            aux_left = S.aux_left,
+            will_commit = will_commit,
+            state = snapshot_state(),
+        }, 1)
+    end
     if S.removetransdInput ~= "" then
         S.last_fist_commit = nil  -- 隐式输入轮，不继承去重状态
         S.aux_left = S.aux_left or ""
@@ -335,6 +404,20 @@ function AuxFilter.longcandimodify_notifier(ctx)
     AuxFilter.Update_codes(ctx)
     S.single_flag = false
     local auxcode = S.inputCode:match(AuxFilter.trigger_key_pattern.. "(%a*)".. AuxFilter.trigger_key_pattern)
+    local will_commit = (S.removetransdInput == "")
+    next_trigger_source = will_commit and "SCRIPT:longcandi_commit" or "SCRIPT:longcandi_restore_aux"
+    if DEBUG_MODE then
+        debug_log({
+            event = "notifier_fired",
+            notifier = "longcandimodify",
+            action = will_commit and "commit" or "restore_aux",
+            auxcode = auxcode,
+            removetransdInput = S.removetransdInput,
+            removeAuxInput = S.removeAuxInput,
+            will_commit = will_commit,
+            state = snapshot_state(),
+        }, 1)
+    end
     if S.removetransdInput ~= "" then
         S.last_fist_commit = nil  -- 隐式输入轮，不继承去重状态
         ctx.input = S.removeAuxInput .. AuxFilter.trigger_key .. auxcode
@@ -347,6 +430,16 @@ end
 function AuxFilter.longcandimodify_ybnotifier(ctx)
     local S = AuxFilter.state
     S.single_flag = false
+    next_trigger_source = "SCRIPT:ybmodify_recompose"
+    if DEBUG_MODE then
+        debug_log({
+            event = "notifier_fired",
+            notifier = "ybmodify",
+            action = "recompose",
+            ybmodifiedcode = S.ybmodifiedcode,
+            state = snapshot_state(),
+        }, 1)
+    end
     ctx.input = S.ybmodifiedcode
 end
 
@@ -603,9 +696,31 @@ function AuxFilter.yield_candisub(cand)
         end
     end
     local cand = finalcandi.cand
+    
+    -- ==========================================
+    -- 🚀 FIX: 拦截纯由辅码/功能码段产生的垃圾候选
+    -- 当引擎吞噬引导键时，尾部的功能码（如 t）会被引擎当作拼音翻译产生候选（如 "他" 或 "图"）。
+    -- 这些候选的 _start 必然在 removeAuxInput 的长度之后，直接果断丢弃！
+    -- ==========================================
+    if S.removeAuxInput and cand._start >= #S.removeAuxInput then
+        return
+    end
+
     local candtext = cand.text
     if S.counter == 1 and (S.dupc ~= 1 or S.transor or S.rawor) then
-        candtext = S.transdcode:gsub("‸","") .. cand.text
+        -- ==========================================
+        -- 🚀 FIX: 修复 transdcode 拼接导致的文本翻倍 BUG
+        -- 当预编辑包含已翻译的中文时，transdcode 已经包含了该中文。
+        -- 若直接与 cand.text 拼接，会导致 "韩信带净化" + "韩信带净化" = "韩信带净化韩信带净化"
+        -- ==========================================
+        local prefix = S.transdcode:gsub("‸","")
+        if cand._start == 0 then
+            prefix = "" -- 候选覆盖全局，不需要前缀
+        elseif candtext ~= "" and prefix:sub(-#candtext) == candtext then
+            prefix = prefix:sub(1, -#candtext - 1) -- 去除重复的后缀
+        end
+        candtext = prefix .. candtext
+        
         if S.dupc ~= 1 then
             candtext = string.rep(candtext, S.dupc)
             cand.comment = "复制" .. tostring(S.dupc) .. "次"
@@ -650,7 +765,7 @@ local function get_syllable_aux_set(syllable)
             step = "cache_hit",
             syllable = syllable,
             status = cached ~= false and "found" or "empty_cached"
-        })
+        }, 3)
         end
         -- false 表示已知无辅码音节，直接拦截，避免重复 iter_dict 全表扫描
         return cached ~= false and cached or nil
@@ -704,7 +819,7 @@ local function get_syllable_aux_set(syllable)
             entries_with_aux = has_aux_count,
             char_list = table.concat(char_list, ","),
             mode = mode
-        })
+        }, 3)
         end
 
         return raw_aux_set, char_list, has_any, single_char_count
@@ -736,7 +851,7 @@ local function get_syllable_aux_set(syllable)
         lookup_result_type = type(lookup_result),
         lookup_result = lookup_result and "truthy" or "falsy",
         mode = "exact"
-    })
+    }, 3)
     end
 
     local raw_aux_set, char_list, has_any, single_char_count
@@ -753,7 +868,7 @@ local function get_syllable_aux_set(syllable)
                 step = "exact_no_single_char_fallback",
                 syllable = syllable,
                 reason = "exact match truthy but no single-char entries found"
-            })
+            }, 3)
             end
             lookup_result = nil  -- 触发下方 fallback
         end
@@ -767,7 +882,7 @@ local function get_syllable_aux_set(syllable)
             step = "try_predictive",
             syllable = syllable,
             mode = "predictive"
-        })
+        }, 3)
         end
 
         lookup_result = AuxFilter.mem:dict_lookup(syllable, true, 0)
@@ -780,7 +895,7 @@ local function get_syllable_aux_set(syllable)
             syllable = syllable,
             lookup_result = lookup_result and "truthy" or "falsy",
             mode = "predictive"
-        })
+        }, 3)
         end
 
         if lookup_result then
@@ -833,7 +948,7 @@ local function get_syllable_aux_set(syllable)
         raw_code_count = code_count,
         char_count = #char_list,
         cached = not is_predictive
-    })
+    }, 3)
     end
 
     return expanded
@@ -1156,7 +1271,7 @@ function AuxFilter.longcandimodify(input, env)
         event = "longcandimodify_start",
         inputCode = S.inputCode,
         precode = S.precode
-    })
+    }, 1)
     end
 
     local function get_first_candidate()
@@ -1250,7 +1365,7 @@ function AuxFilter.longcandimodify(input, env)
                 index = index,
                 value = value,
                 zi = zi
-            })
+            }, 3)
             end
 
             local fuset = get_syllable_aux_set(value)
@@ -1275,7 +1390,7 @@ function AuxFilter.longcandimodify(input, env)
                 fuset_exists = fuset ~= nil,
                 fuset_keys = fuset_keys,
                 fuset_size = fuset and #fuset_keys or 0
-            })
+            }, 3)
             end
 
             local matched = combmath(auxcode, fuset)
@@ -1292,7 +1407,7 @@ function AuxFilter.longcandimodify(input, env)
                 combmath_detail = fuset
                     and ("fuset[" .. auxcode .. "] = " .. tostring(fuset[auxcode]))
                     or "fuset is nil"
-            })
+            }, 3)
             end
 
             if DEBUG_MODE then
@@ -1316,7 +1431,7 @@ function AuxFilter.longcandimodify(input, env)
                 matched = matched,
                 final_ficompensate = matched and index or nil,
                 matchedmark_will_be = matched and true or matchedmark
-            })
+            }, 3)
             end
 
             if matched then
@@ -1329,7 +1444,7 @@ function AuxFilter.longcandimodify(input, env)
                         step = "break_early",
                         index = index,
                         reason = "passnum_reached_zero"
-                    })
+                    }, 3)
                     end
                     break
                 end
@@ -1359,7 +1474,7 @@ function AuxFilter.longcandimodify(input, env)
         debug_log({
             event = "longcandimodify_end",
             status = "no_candidate"
-        })
+        }, 1)
         end
         return
     end
@@ -1403,7 +1518,7 @@ function AuxFilter.longcandimodify(input, env)
                 error = "target_idx_out_of_bounds",
                 target_idx = target_idx,
                 inputspls_length = #fresh_spls
-            })
+            }, 1)
             end
 
             yield(Candidate(firstcandi.type, firstcandi._start, firstcandi._start,
@@ -1453,7 +1568,7 @@ function AuxFilter.longcandimodify(input, env)
     debug_log({
         event = "longcandimodify_end",
         status = "completed"
-    })
+    }, 1)
     end
 end
 
@@ -1474,8 +1589,47 @@ function AuxFilter.Update_codes(ctx)
     S.inputCode = transform_input_code(S.inputCode)
     S.precode = context:get_preedit().text
     S.precode = transform_input_code(S.precode)
+
+    local tkp = AuxFilter.trigger_key
+    local tkp_pat = AuxFilter.trigger_key_pattern
+
     S.removeAuxInput = S.inputCode:match(AuxFilter.pattern_removeAux) or ""
-    S.removeAuxprecode = S.precode:match(AuxFilter.pattern_removeAux) or ""
+    local raw_removeAuxprecode = S.precode:match(AuxFilter.pattern_removeAux) or ""
+
+    -- ==========================================
+    -- 🚀 时空缓存防吞噬机制（主防线）
+    -- 当 precode 健康（含引导键）时缓存正确的 removeAuxprecode。
+    -- 当引擎吞噬引导键导致 precode 被污染时，从缓存回档纯净值。
+    -- 一次清洗，所有下游变量（removetransdInput/transdcode/transdcodei）自动纯净。
+    -- ==========================================
+    AuxFilter.good_precode_cache = AuxFilter.good_precode_cache or {}
+
+    if S.precode:find(tkp, 1, true) then
+        -- precode 健康：引导键存在，提取结果可信，存入缓存
+        AuxFilter.good_precode_cache[S.inputCode] = raw_removeAuxprecode
+        S.removeAuxprecode = raw_removeAuxprecode
+    elseif S.inputCode:find(tkp, 1, true) then
+        -- 引擎吞噬了引导键：precode 已被污染
+        if AuxFilter.good_precode_cache[S.inputCode] then
+            -- 缓存命中：从保险箱回档纯净值
+            S.removeAuxprecode = AuxFilter.good_precode_cache[S.inputCode]
+        else
+            -- 缓存未命中（兜底）：启发式剥离尾部辅码残骸
+            S.removeAuxprecode = raw_removeAuxprecode
+            local aux_part = S.inputCode:match(tkp_pat .. "(.*)$") or ""
+            if aux_part ~= "" then
+                local trailing = S.removeAuxprecode:match("(%a+)‸?$") or ""
+                if trailing ~= "" and aux_part:sub(-#trailing) == trailing then
+                    S.removeAuxprecode = S.removeAuxprecode:gsub(trailing .. "(‸?)$", "%1")
+                end
+            end
+        end
+    else
+        -- 无引导键：普通输入，直接使用
+        S.removeAuxprecode = raw_removeAuxprecode
+    end
+    -- ==========================================
+
     S.removetransdInput = S.removeAuxprecode:match(AuxFilter.pattern_removetransd) or ""
     local pos1 = S.removeAuxprecode:find(S.removetransdInput, 1, true)
     if pos1 and S.removetransdInput ~= "" then
@@ -1501,6 +1655,7 @@ end
 
 function AuxFilter.func(input, env)
     AuxFilter.env = env
+    round_counter = round_counter + 1
     if not AuxFilter.state then
         AuxFilter.state = {
             single_flag = false,
@@ -1546,9 +1701,9 @@ function AuxFilter.func(input, env)
         event = "func_dispatch",
         inputCode = S.inputCode,
         precode = S.precode,
-        pattern_main1 = AuxFilter.pattern_main1,
-        pattern_long = AuxFilter.pattern_long
-    })
+        single_flag = S.single_flag,
+        state = snapshot_state(),
+    }, 1)
     end
 
     -- 守卫：输入仅为触发键（无前置拼音），不产出候选
@@ -1579,8 +1734,9 @@ function AuxFilter.func(input, env)
         debug_log({
             event = "func_dispatch",
             branch = "longcandimodify",
-            inputCode = S.inputCode
-        })
+            inputCode = S.inputCode,
+            state = snapshot_state(),
+        }, 1)
         end
 
         AuxFilter.longcandimodify(input,env)
@@ -1589,6 +1745,7 @@ function AuxFilter.func(input, env)
         S.transedtext = nil
         AuxFilter.defaultmain(input,env)
     end
+    next_trigger_source = nil  -- 轮次结束，清空染色标记
 end
 
 function AuxFilter.fini(env)
@@ -1596,9 +1753,10 @@ function AuxFilter.fini(env)
     if env.update_notifier then
         env.update_notifier:disconnect()
     end
-    if debugfile then
-        debugfile:close()
-    end
+    -- debugfile 是模块级全局变量，不能在 fini 中 close
+    -- Rime 会频繁销毁/重建 Filter 实例，close 后新实例写入会触发
+    -- "attempt to use a closed file" 致命错误，让脚本全盘崩溃
+    -- setvbuf("line") 已保证每行落盘，由进程结束自然回收即可
 end
 
 return AuxFilter
