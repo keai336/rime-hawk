@@ -90,6 +90,47 @@ local function countSubstringOccurrences(str, substr)
     return count
 end
 
+local function split_first_plain(str, sep)
+    str = str or ""
+    if sep == nil or sep == "" then
+        return str, "", false
+    end
+    local pos = str:find(sep, 1, true)
+    if not pos then
+        return str, "", false
+    end
+    return str:sub(1, pos - 1), str:sub(pos + #sep), true
+end
+
+local function strip_ascii_tail_leak(preedit, tail)
+    preedit = preedit or ""
+    tail = tail or ""
+    if preedit == "" or tail == "" then
+        return preedit
+    end
+    local trailing = preedit:match("(%a+)‸?$") or ""
+    if trailing ~= "" and tail:sub(-#trailing) == trailing then
+        return preedit:gsub(trailing .. "(‸?)$", "%1")
+    end
+    return preedit
+end
+
+local function parse_long_tail(tail, trigger)
+    tail = tail or ""
+    trigger = trigger or ""
+    local second_pos = trigger ~= "" and tail:find(trigger, 1, true)
+    if not second_pos then
+        return "", ""
+    end
+
+    local auxcode = tail:sub(1, second_pos - 1)
+    local funccode_start = second_pos
+    while trigger ~= "" and tail:sub(funccode_start, funccode_start + #trigger - 1) == trigger do
+        funccode_start = funccode_start + #trigger
+    end
+    return auxcode, tail:sub(funccode_start)
+end
+
 local function utf8len(str)
     return utf8.len(str) or 0
 end
@@ -188,7 +229,7 @@ function AuxFilter.init(env)
     AuxFilter.pattern_singlechar_switch = "^[^" .. tkp .. "]+" .. tkp .. "%a*" .. skp .. "$"
     AuxFilter.pattern_long             = "^[^" .. tkp .. "]+" .. tkp .. "%a*" .. tkp .. "+%a*$"
     AuxFilter.pattern_removeAux        = "^([^" .. tkp .. "]*)" .. tkp .. "-"
-    AuxFilter.pattern_removetransd     = "^[^a-z;]*([%a;]*)"
+    AuxFilter.pattern_removetransd     = "^[^a-z" .. tkp .. "]*([%a" .. tkp .. "]*)"
     -- transform_input_code 用到的正则
     AuxFilter.pattern_transform = "^([^" .. php .. tkp .. "]+)"
                                   .. tkp .. "*" .. php
@@ -204,7 +245,7 @@ function AuxFilter.init(env)
             AuxFilter.state.one_aux_firstcode = nil
             AuxFilter.state.aux_left = nil
             AuxFilter.state.transedtext = nil
-            AuxFilter.good_precode_cache = {} -- 组字结束，清空时空缓存
+            AuxFilter.preedit_prefix_cache = {}
         end
     end)
     env.notifier = engine.context.select_notifier:connect(function(ctx)
@@ -228,10 +269,7 @@ function AuxFilter.main1_notifier(ctx)
         return
     end
     AuxFilter.Update_codes(ctx)
-    -- 泄漏检测：removetransdInput 恰好等于单辅码本身，说明是 Rime 引擎
-    -- 将辅码字母当作独立段翻译后泄漏出来的，不是真实的剩余拼音
-    local leaked_aux = (S.aux_left == nil and S.auxStr ~= "" and S.removetransdInput == S.auxStr)
-    if S.removetransdInput ~= "" and not leaked_aux then
+    if S.removetransdInput ~= "" then
         S.last_fist_commit = nil  -- 隐式输入轮，不继承去重状态
         S.aux_left = S.aux_left or ""
         ctx.input = S.removeAuxInput .. AuxFilter.trigger_key .. S.aux_left
@@ -246,7 +284,7 @@ function AuxFilter.longcandimodify_notifier(ctx)
     local S = AuxFilter.state
     AuxFilter.Update_codes(ctx)
     S.single_flag = false
-    local auxcode = S.inputCode:match(AuxFilter.trigger_key_pattern.. "(%a*)".. AuxFilter.trigger_key_pattern)
+    local auxcode = parse_long_tail(S.raw_tail, AuxFilter.trigger_key)
     if S.removetransdInput ~= "" then
         S.last_fist_commit = nil  -- 隐式输入轮，不继承去重状态
         ctx.input = S.removeAuxInput .. AuxFilter.trigger_key .. auxcode
@@ -476,6 +514,11 @@ end
 function AuxFilter.yield_candisub(cand)
     local S = AuxFilter.state
     local finalcandi = cand
+    local output_cand = finalcandi.cand
+    if S.has_trigger and S.removeAuxInput and output_cand._start
+       and output_cand._start >= #S.removeAuxInput then
+        return
+    end
     if S.yieldrawset[finalcandi.rawcand.text] then
         return
     end
@@ -515,23 +558,8 @@ function AuxFilter.yield_candisub(cand)
         end
     end
     local cand = finalcandi.cand
-    
-    -- ==========================================
-    -- 🚀 FIX: 拦截纯由辅码/功能码段产生的垃圾候选
-    -- 当引擎吞噬引导键时，尾部的功能码（如 t）会被引擎当作拼音翻译产生候选（如 "他" 或 "图"）。
-    -- 这些候选的 _start 必然在 removeAuxInput 的长度之后，直接果断丢弃！
-    -- ==========================================
-    if S.removeAuxInput and cand._start >= #S.removeAuxInput then
-        return
-    end
-
     local candtext = cand.text
     if S.counter == 1 and (S.dupc ~= 1 or S.transor or S.rawor) then
-        -- ==========================================
-        -- 🚀 FIX: 修复 transdcode 拼接导致的文本翻倍 BUG
-        -- 当预编辑包含已翻译的中文时，transdcode 已经包含了该中文。
-        -- 若直接与 cand.text 拼接，会导致 "韩信带净化" + "韩信带净化" = "韩信带净化韩信带净化"
-        -- ==========================================
         local prefix = S.transdcode:gsub("‸","")
         if cand._start == 0 then
             prefix = "" -- 候选覆盖全局，不需要前缀
@@ -855,8 +883,8 @@ function AuxFilter.main1(input, env)
     local S = AuxFilter.state
     local function process_input()
         S.auxStr, S.funccode = "", ""
-        local localSplit = S.inputCode:match(AuxFilter.trigger_key_pattern .. "([^"..AuxFilter.trigger_key_pattern.."]+)")
-        if localSplit then
+        local localSplit = S.raw_tail
+        if S.has_trigger and localSplit ~= "" then
             S.auxStr = string.sub(localSplit, 1, 2)
             S.funccode = string.sub(localSplit, #S.auxStr + 1)
             S.auxStr = S.auxStr:gsub(AuxFilter.ph_pattern, "")
@@ -984,8 +1012,7 @@ function AuxFilter.longcandimodify(input, env)
     end
 
     local function parse_input_code()
-        local auxcode = S.inputCode:match(AuxFilter.trigger_key_pattern .. "(%a*)" .. AuxFilter.trigger_key_pattern)
-        local funccode = S.inputCode:match(AuxFilter.trigger_key_pattern .. "%a*" .. AuxFilter.trigger_key_pattern .. "+(%a*)")
+        local auxcode, funccode = parse_long_tail(S.raw_tail, AuxFilter.trigger_key)
         local ybmodif = funccode and funccode:match("s(%a+)")
 
         if ybmodif then
@@ -1108,45 +1135,25 @@ function AuxFilter.Update_codes(ctx)
     S.precode = context:get_preedit().text
     S.precode = transform_input_code(S.precode)
 
-    local tkp = AuxFilter.trigger_key
-    local tkp_pat = AuxFilter.trigger_key_pattern
+    local input_prefix, input_tail, has_trigger = split_first_plain(S.inputCode, AuxFilter.trigger_key)
+    local preedit_prefix, _, preedit_has_trigger = split_first_plain(S.precode, AuxFilter.trigger_key)
+    S.has_trigger = has_trigger
+    S.raw_tail = input_tail
+    S.preedit_has_trigger = preedit_has_trigger
+    S.removeAuxInput = input_prefix
 
-    S.removeAuxInput = S.inputCode:match(AuxFilter.pattern_removeAux) or ""
-    local raw_removeAuxprecode = S.precode:match(AuxFilter.pattern_removeAux) or ""
-
-    -- ==========================================
-    -- 🚀 时空缓存防吞噬机制（主防线）
-    -- 当 precode 健康（含引导键）时缓存正确的 removeAuxprecode。
-    -- 当引擎吞噬引导键导致 precode 被污染时，从缓存回档纯净值。
-    -- 一次清洗，所有下游变量（removetransdInput/transdcode/transdcodei）自动纯净。
-    -- ==========================================
-    AuxFilter.good_precode_cache = AuxFilter.good_precode_cache or {}
-
-    if S.precode:find(tkp, 1, true) then
-        -- precode 健康：引导键存在，提取结果可信，存入缓存
-        AuxFilter.good_precode_cache[S.inputCode] = raw_removeAuxprecode
-        S.removeAuxprecode = raw_removeAuxprecode
-    elseif S.inputCode:find(tkp, 1, true) then
-        -- 引擎吞噬了引导键：precode 已被污染
-        if AuxFilter.good_precode_cache[S.inputCode] then
-            -- 缓存命中：从保险箱回档纯净值
-            S.removeAuxprecode = AuxFilter.good_precode_cache[S.inputCode]
+    AuxFilter.preedit_prefix_cache = AuxFilter.preedit_prefix_cache or {}
+    if has_trigger then
+        if preedit_has_trigger then
+            S.removeAuxprecode = preedit_prefix
+            AuxFilter.preedit_prefix_cache[input_prefix] = preedit_prefix
         else
-            -- 缓存未命中（兜底）：启发式剥离尾部辅码残骸
-            S.removeAuxprecode = raw_removeAuxprecode
-            local aux_part = S.inputCode:match(tkp_pat .. "(.*)$") or ""
-            if aux_part ~= "" then
-                local trailing = S.removeAuxprecode:match("(%a+)‸?$") or ""
-                if trailing ~= "" and aux_part:sub(-#trailing) == trailing then
-                    S.removeAuxprecode = S.removeAuxprecode:gsub(trailing .. "(‸?)$", "%1")
-                end
-            end
+            S.removeAuxprecode = AuxFilter.preedit_prefix_cache[input_prefix]
+                or strip_ascii_tail_leak(preedit_prefix, input_tail)
         end
     else
-        -- 无引导键：普通输入，直接使用
-        S.removeAuxprecode = raw_removeAuxprecode
+        S.removeAuxprecode = preedit_prefix
     end
-    -- ==========================================
 
     S.removetransdInput = S.removeAuxprecode:match(AuxFilter.pattern_removetransd) or ""
     local pos1 = S.removeAuxprecode:find(S.removetransdInput, 1, true)
@@ -1204,6 +1211,9 @@ function AuxFilter.func(input, env)
     S.ftext = nil
     S.inputCode = ""
     S.precode = ""
+    S.has_trigger = false
+    S.raw_tail = ""
+    S.preedit_has_trigger = false
     S.removeAuxInput = ""
     S.removeAuxprecode = ""
     S.removetransdInput = ""
