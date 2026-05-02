@@ -1,435 +1,225 @@
-# aux_v2_debug.lua 技术文档
+# Rime Hawk 技术文档
 
-> Rime 输入法辅码过滤插件 | 版本: v2_debug | 日期: 2026-04-25
+> 当前实现：`aux_v2.lua` 为生产脚本，`aux_v2_debug.lua` 为同逻辑调试脚本。本文档按 2026-05-02 当前分支更新。
 
----
+## 1. 定位
 
-## 1. 概述
+Rime Hawk 是一个 Rime Lua 过滤器。它不负责拼音翻译，而是在候选列表生成之后，用“拼音 + 辅码”继续筛选候选。
 
-`aux_v2_debug.lua` 是一个 Rime 输入法 Lua 过滤器插件，用于实现辅码（辅助编码）功能。
+适合的能力边界：
 
-### 1.1 什么是辅码？
+- 高频路径：普通单码/双码辅码过滤。
+- 低频纠偏：单字模式、二字词分心、长句断句、修音。
+- 可选能力：简繁转换、本地 HTTP 请求。
 
-辅码是一种辅助输入编码，用于在输入拼音后进一步筛选候选字/词。例如：
-- 输入 `zh;vv` → 只显示拼音为 "zh" 且辅码包含 "vv" 的候选词
-- 用于五笔、郑码等形码输入法的辅助筛选
+## 2. 文件角色
 
-### 1.2 核心能力
+| 文件 | 角色 |
+|---|---|
+| `aux_v2.lua` | 推荐部署的生产脚本 |
+| `aux_v2_debug.lua` | 调试脚本，增加 JSONL 日志和触发源染色 |
+| `test5.txt` | 示例辅码表 |
+| `docs/log_parser.html` | 调试日志查看器 |
 
-| 功能 | 说明 |
-|------|------|
-| 辅码筛选 | 根据辅码过滤候选词 |
-| 断句功能 | 长句自动在匹配点截断 |
-| 修音功能 | 修改已输入的拼音音节 |
-| 智能指令 | 支持偏移、复制、翻译等操作 |
+生产和调试脚本的业务逻辑应保持一致；调试版只增加日志，不作为默认部署目标。
 
----
-
-## 2. 架构图
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Rime 输入引擎                           │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  输入 "zh;vv;"                                               │
-│      ↓                                                      │
-│  ┌─────────────────┐                                         │
-│  │ func()          │ ← 入口函数，分发到各处理分支            │
-│  └────────┬────────┘                                         │
-│           ↓                                                  │
-│  ┌────────┴────────────────────────────────────────┐        │
-│  │                    模式匹配                        │        │
-│  ├───────────────┬───────────────┬──────────────────┤        │
-│  │ pattern_main1 │ pattern_long  │ pattern_default  │        │
-│  │   普通辅码    │  长句/断句/修音 │    透传         │        │
-│  └───────┬───────┴───────┬───────┴───────┬──────────┘        │
-│          ↓               ↓               ↓                   │
-│  ┌───────┴───────┐ ┌─────┴─────┐ ┌───────┴────────┐          │
-│  │ main1()      │ │ longcandi-│ │ defaultmain() │          │
-│  │              │ │ modify()  │ │                │          │
-│  │ 普通辅码筛选  │ │ 断句+修音  │ │ 直接透传候选   │          │
-│  └──────────────┘ └───────────┘ └────────────────┘          │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 3. 核心数据结构
-
-### 3.1 状态对象 `AuxFilter.state`
-
-```lua
-S = {
-    -- 辅码相关
-    auxStr = "",         -- 辅码字符串，如 "vv"
-    funccode = "",       -- 功能码，如 "a", "d", "w"
-
-    -- 断句相关
-    ficompensate = nil,  -- 断点位置
-    matchedmark = false, -- 是否找到匹配
-    leftcompen = 0,      -- 左偏移
-    rightcompen = 0,     -- 右偏移
-
-    -- 修音相关
-    ybmodifiedcode = "", -- 修音后的编码
-
-    -- 其他
-    single_flag = false, -- 单字筛选模式
-    counter = 0,         -- 已输出候选计数
-    dupc = 1,            -- 复制次数
-    transor = false,     -- 翻译开关
-}
-```
-
-### 3.2 配置文件
-
-```lua
-AuxFilter = {
-    trigger_key = ";",      -- 触发键
-    ph = ",",               -- 辅码分隔符
-    switch_key = "`",       -- 单字切换键
-    matchmode = 1,          -- 0=全码模式, 1=简码模式
-    show_aux_notice = true,-- 显示辅码提示
-    aux_code = {},          -- 字→辅码映射表
-}
-```
-
-### 3.3 缓存
-
-| 缓存名 | 键 | 值 | 说明 |
-|--------|----|----|------|
-| `syllable_aux_cache` | 音节字符串 | 辅码布尔哈希表 / `false` | 进程级，精确匹配时缓存；`false` 表示查询失败 |
-| `pinyin_cache` | 拼音原始字符串 | 音节字符串数组 | 空格切分结果缓存 |
-| `fullAuxCache` | 词文本 | `{首码串, 次码串}` | 多字词按需计算的完整辅码缓存 |
-| `AuxFilter.fullAux_precomputed` | 单字文本 | `{首码串, 次码串}` | 启动时预计算的单字辅码，O(1) 查询 |
-
-> `utf8lenCache` 已移除，改用标准库 `utf8.len()`。
-
----
-
-## 4. 核心函数详解
-
-### 4.1 `get_syllable_aux_set(syllable)`
-
-**功能**: 获取某个拼音音节对应的辅码集合（通过 Memory API 动态查询词典）
-
-**参数**:
-- `syllable`: 拼音音节，如 `"zhong"`, `"q"`
-
-**返回值**: 辅码展开集合（布尔哈希表），如 `{["v"]=true, ["vv"]=true, ...}`；查询失败返回 `nil`
-
-**核心流程**:
-```lua
-local function get_syllable_aux_set(syllable)
-    -- 1. 缓存命中直接返回（false 表示已知查无结果）
-    local cached = syllable_aux_cache[syllable]
-    if cached then return cached end
-
-    -- 2. 精确匹配（predictive=false, limit=0）
-    local lookup_result = mem:dict_lookup(syllable, false, 0)
-    local is_predictive = false
-
-    if lookup_result then
-        -- 遍历 iter_dict，收集所有单字的辅码
-        raw_aux_set, char_list, has_any, single_char_count = collect_aux_from_iter("exact")
-
-        -- 精确匹配成功但无单字结果 → fallback 到前缀匹配
-        if single_char_count == 0 then
-            lookup_result = nil
-        end
-    end
-
-    -- 3. 精确匹配无效，fallback 前缀匹配（predictive=true）
-    if not lookup_result then
-        lookup_result = mem:dict_lookup(syllable, true, 0)
-        is_predictive = true
-        if lookup_result then
-            raw_aux_set, char_list, has_any, single_char_count = collect_aux_from_iter("predictive")
-        end
-    end
-
-    -- 4. 两种方式均失败，仅精确失败时缓存 false
-    if not lookup_result or not has_any then
-        if not is_predictive then
-            syllable_aux_cache[syllable] = false
-        end
-        return nil
-    end
-
-    -- 5. 展开辅码（首码 + 全码；matchmode==0 时额外添加次码）
-    for key in pairs(raw_aux_set) do
-        expanded[key:sub(1, 1)] = true
-        if matchmode == 0 then expanded[key:sub(2, 2)] = true end
-        expanded[key] = true
-    end
-
-    -- 6. 仅精确匹配结果写入缓存，前缀匹配不缓存
-    if not is_predictive then
-        syllable_aux_cache[syllable] = expanded
-    end
-
-    return expanded
-end
-```
-
-> **关键设计**：`is_predictive` 标志替代了旧版 `no_cache` 参数，逻辑内聚在函数体内。
-
-### 4.2 `find_break_point(inputspls, auxcode)`
-
-**功能**: 在音节数组中找到辅码匹配的断点位置
-
-**参数**:
-- `inputspls`: 音节数组，如 `["zh", "i", "nan"]`
-- `auxcode`: 辅码，如 "vv"
-
-**返回值**: 找到匹配时 `matchedmark=true`，`ficompensate=截断位置`
-
-**核心流程**:
-```lua
-function find_break_point(inputspls, auxcode)
-    for index, syllable in ipairs(inputspls) do
-        local zi = utf8sub(ftext, index, index)  -- 当前汉字
-        local fuset = get_syllable_aux_set(syllable)  -- 获取辅码集合
-
-        -- 匹配辅码
-        if combmath(auxcode, fuset) then
-            ficompensate = index
-            matchedmark = true
-            break
-        end
-    end
-    return matchedmark
-end
-```
-
-### 4.3 `combmath(aux, fuset)`
-
-**功能**: 判断辅码是否匹配
-
-```lua
-local function combmath(aux, fuset)
-    if #aux == 0 then return true end        -- 无辅码默认全匹配
-    if not fuset then return false end        -- 辅码集合为 nil
-    -- matchmode==1（简码）: 仅正向查表
-    -- matchmode==0（全码）: 正向 + 反转均可匹配
-    return fuset[aux] or (AuxFilter.matchmode == 0 and fuset[aux:reverse()])
-end
-```
-
-> **注意**：全码模式（`matchmode=0`）下 `"ab"` 和 `"ba"` 视为等价辅码。
-
----
-
-## 5. 输入模式与处理分支
-
-### 5.1 普通辅码模式
-
-**输入格式**: `拼音;辅码`
-
-**示例**: `zh;vv`
-
-**流程**:
-```
-输入 "zh;vv"
-  ↓
-pattern_main1 匹配成功
-  ↓
-main1() 处理
-  ↓
-获取候选词 → 过滤辅码 → 输出
-```
-
-### 5.2 长句断句模式
-
-**输入格式**: `拼音;辅码;`
-
-**示例**: `zhongguo;vv;`
-
-**流程**:
-```
-输入 "zhongguo;vv;"
-  ↓
-pattern_long 匹配成功（两个及以上分号）
-  ↓
-longcandimodify() 处理
-  ↓
-find_break_point() 查找断点
-  ↓
-截取匹配位置前的汉字输出
-```
-
-### 5.3 修音模式
-
-**输入格式**: `拼音;辅码;s新音节`
-
-**示例**: `zhong;sguo`（把 zhong 改成 guo）
-
-**流程**:
-```
-输入 "zhong;sguo"
-  ↓
-识别功能码 "sguo"（s开头表示修音）
-  ↓
-分离出新音节 "guo"
-  ↓
-修改 inputspls 中的音节
-  ↓
-重新生成输入码
-```
-
----
-
-## 6. 智能指令系统
-
-### 6.1 偏移指令
-
-| 指令 | 效果 |
-|------|------|
-| `a` | 左偏移 1 字符 |
-| `s` | 左偏移 2 字符 |
-| `d` | 右偏移 1 字符 |
-| `f` | 右偏移 2 字符 |
-
-### 6.2 复制指令
-
-| 指令 | 效果 |
-|------|------|
-| `c` | 复制次数 +1 |
-| `v` | 复制次数 ×2 |
-| `n` | 复制次数 -1 |
-
-### 6.3 翻译指令
-
-格式: `t目标`（如 `ten` 翻译为英文）
-
----
-
-## 7. 关键修复记录
-
-### 7.1 v2: 修音崩溃修复
-
-**问题**: 修音分支直接修改 `inputspls` 数组，污染 `split_pinyin()` 缓存
-
-**修复**: 创建副本 `fresh_spls`，不直接修改原数组
-
-```lua
--- 修复前（有bug）
-inputspls[S.ficompensate + 1] = ybmodif
-
--- 修复后
-local fresh_spls = {}
-for i, v in ipairs(inputspls) do
-    fresh_spls[i] = v
-end
-fresh_spls[S.ficompensate + 1] = ybmodif
-```
-
-### 7.2 前缀匹配缓存控制
-
-**问题**: 前缀匹配 `predictive=true` 会跨音节匹配，不同上下文结果不同，若缓存会导致错误命中或内存爆炸
-
-**修复**: 引入 `is_predictive` 标志，前缀匹配结果不写入缓存
-
-```lua
--- 旧方案（有 no_cache 参数，已废弃）
-local function get_syllable_aux_set(syllable, no_cache) ... end
-
--- 当前方案（is_predictive 内聚于函数体）
-local is_predictive = false
-if not lookup_result then
-    lookup_result = mem:dict_lookup(syllable, true, 0)
-    is_predictive = true
-end
--- ...
-if not is_predictive then
-    syllable_aux_cache[syllable] = expanded  -- 仅精确匹配结果缓存
-end
-```
-
----
-
-## 8. 调试系统
-
-### 8.1 日志开关
-
-```lua
-local DEBUG_MODE = true  -- 设为 false 关闭日志
-```
-
-### 8.2 日志格式
-
-JSON Lines 格式，输出到 `用户数据目录/debug_breakpoint.log`
-
-### 8.3 关键日志事件
-
-| 事件 | 说明 |
-|------|------|
-| `session_start` | 会话开始 |
-| `get_syllable_aux_set` | 音节辅码查询 |
-| `find_break_point_loop` | 断点查找循环 |
-| `longcandimodify_*` | 长句处理各阶段 |
-
----
-
-## 9. 配置参数
-
-在 YAML 中配置：
+## 3. 配置入口
 
 ```yaml
-filters:
-  - lua_filter@aux_v2_debug@ZRM_Aux-code@on@;@`@,@s
+engine:
+  filters:
+    - lua_filter@aux_v2@test5@on@;@`@,@s
 ```
 
-参数顺序（用 `@` 分隔）：
-1. `path` - 辅码文件路径（不含扩展名）
-2. `showor` - 显示辅码提示（on/off）
-3. `trigger` - 触发键（默认 `;`）
-4. `switch` - 单字切换键（默认 `` ` ``）
-5. `ph` - 辅码分隔符（默认 `,`）
-6. `matchmode` - 匹配模式（s=简码，m=全码）
+参数顺序：
 
----
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `path` | `ZRM_Aux-code` | 辅码表文件名，不带 `.txt` |
+| `showor` | `on` | 是否在候选注释中显示辅码 |
+| `trigger` | `;` | 辅码引导键 |
+| `switch` | `` ` `` | 单字模式切换键 |
+| `ph` | `,` | 占位符，用于主动分心 |
+| `matchmode` | `s` | `s` 为严格顺序，其他值走全码兼容 |
 
-## 10. 文件结构
+如果方案已有 `translator/preedit_format`，应改名为 `translator/preedit_format1`，让 Hawk 内部读取并应用 projection。
 
+## 4. 入口架构
+
+```text
+AuxFilter.init(env)
+  ├─ 解析 name_space 参数
+  ├─ 加载 preedit_format1
+  ├─ 加载辅码表并预计算单字 fullAux
+  ├─ 初始化 OpenCC / Memory
+  ├─ 预编译输入 pattern
+  └─ 连接 update_notifier / select_notifier
+
+AuxFilter.func(input, env)
+  ├─ 清理当前轮状态
+  ├─ Update_codes(ctx)
+  ├─ 触发键独立成段守卫
+  ├─ main1()
+  ├─ switch_single_char() + main1()
+  ├─ longcandimodify()
+  └─ defaultmain()
+
+AuxFilter.fini(env)
+  └─ 断开通知器
 ```
-lua/refactor/
-├── aux_v2_debug.lua        # 主脚本（当前版本）
-└── docs/
-    ├── technical_docs.md   # 技术文档（本文件）
-    ├── api_reference.md    # API 速查手册
-    └── data_flow.md        # 数据流图解
+
+## 5. 状态和缓存
+
+### 5.1 当前轮状态 `AuxFilter.state`
+
+| 字段 | 说明 |
+|---|---|
+| `inputCode` / `precode` | 当前 input 和 preedit，已做内部规整 |
+| `has_trigger` / `preedit_has_trigger` | input/preedit 是否包含引导键 |
+| `removeAuxInput` | 第一个引导键前的输入前缀 |
+| `raw_tail` | 第一个引导键后的原始尾部 |
+| `removeAuxprecode` | 去除辅码后的 preedit 前缀 |
+| `removetransdInput` | preedit 中已被 projection 转换的输入片段 |
+| `transdcode` / `transdcodei` | 去除转换片段后的前缀 |
+| `auxStr` / `funccode` | 当前辅码和功能指令 |
+| `single_flag` | 单字筛选模式 |
+| `distraction` | 主动分心模式 |
+| `aux_left` | 留给下一轮的剩余辅码 |
+| `ficompensate` | 长句断句/修音断点 |
+| `ybmodifiedcode` | 修音后重组输入 |
+
+### 5.2 进程级缓存
+
+| 缓存 | 说明 |
+|---|---|
+| `AuxFilter.aux_code` | 字到辅码字符串 |
+| `AuxFilter.fullAux_precomputed` | 单字 `{首码串, 次码串}` |
+| `fullAuxCache` | 多字候选 fullAux 按需缓存 |
+| `pinyin_cache` | preedit 音节切分缓存 |
+| `syllable_aux_cache` | 精确音节到辅码集合 |
+| `preedit_prefix_cache` | composition 内 preedit 前缀缓存，用于防吞噬 |
+
+## 6. 输入解析和引导键防吞噬
+
+最近修复的核心在 `Update_codes(ctx)`。
+
+旧问题是：Rime 有时会让 `context.input` 保留引导键，但 `preedit` 不保留，或把辅码尾巴混入 preedit。选中候选后如果只信任其中一边，就会出现引导键被吞、尾部重复或剩余输入错误。
+
+当前流程：
+
+1. `context.input` 和 `preedit` 都先经过 `transform_input_code()`。
+2. 用 `split_first_plain()` 按第一个引导键拆分 input，得到 `removeAuxInput` 和 `raw_tail`。
+3. 同样拆分 preedit。
+4. 如果 preedit 仍含引导键，直接记录 preedit 前缀，并写入 `preedit_prefix_cache[input_prefix]`。
+5. 如果 preedit 不含引导键，优先从缓存恢复；没有缓存时，用 `strip_ascii_tail_leak()` 去掉可能泄漏的 ASCII 尾巴。
+6. 输入只有引导键时，`func()` 直接返回，不再透传候选。
+
+这使普通辅码、分心、断句和修音都共享同一套前缀恢复逻辑。
+
+## 7. 普通辅码筛选
+
+`main1()` 解析 `S.raw_tail`：
+
+- 前两位作为辅码候选。
+- 占位符 `,` 会被剥离。
+- 两位辅码后紧跟占位符时，进入主动分心。
+- 剩余部分交给 `parseIntelligentCode()` 解析。
+
+`main_main()` 负责候选匹配：
+
+1. 取候选真实文本，Shadow 候选取 genuine text。
+2. 单字优先查 `fullAux_precomputed`。
+3. 多字词查 `fullAuxCache`，未命中再调用 `fullAux()`。
+4. 调用 `AuxFilter.match()` 判断普通辅码。
+5. 二字词双码进入分心逻辑。
+6. 命中候选通过 `yield_candisub()` 输出。
+
+没有候选命中时，`handle_no_match()` 用首候选生成可继续输入的截断候选。当前实现已修正兜底候选 `_start/_end` 范围。
+
+## 8. 分心机制
+
+分心是低频纠偏，不是普通输入主路径。
+
+| 标记 | 来源 | 含义 |
+|---|---|---|
+| `**` | 被动分心 | 二字词两字分别命中双码 |
+| `*x` | 潜在分心 | 首字命中，次码保留给下一轮 |
+| `⇐` | 主动分心 | 占位符触发，二字完整命中 |
+| `✂` | 主动分心截断 | 占位符触发，首字截断后继续 |
+
+主动分心和被动分心都要校验首字是否等于已锁定首字，避免用户想要的首字被后续候选替换。
+
+潜在分心还会通过 `get_syllable_aux_set()` 对第二音节做前瞻探路。如果第二码不可能命中下一音节，就不输出 `*x` / `✂` 诱导候选。
+
+## 9. 长句断句和修音
+
+长句模式由 `pattern_long` 进入：
+
+```text
+拼音;辅码;
+拼音;辅码;s新音节
 ```
 
----
+`parse_long_tail(S.raw_tail, trigger)` 只解析引导键后的尾部：
 
-## 11. 常见问题
+- 第二个引导键前是断句辅码。
+- 连续引导键会被跳过。
+- 后续文本是功能码。
 
-### Q1: 简拼断句失败？
+`find_break_point()` 遍历首候选 preedit 切出的音节，调用 `get_syllable_aux_set()` 取音节可用辅码，再用 `combmath()` 判断是否命中。多个引导键会让它跳过前面的命中点。
 
-**原因**: 简拼 "q" 不是完整音节，`dict_lookup` 精确匹配失败
+修音分支的关键约束：
 
-**解决方案**: 前缀匹配作为 fallback（当前已实现）
+- 不直接修改 `inputspls`。
+- 先复制到 `fresh_spls`。
+- 对 `target_idx` 做越界检查。
+- 用 `S.ybmodifiedcode` 交给 `longcandimodify_ybnotifier()` 重写输入。
 
-### Q2: 内存占用大？
+## 10. 音节辅码集合
 
-**原因**: 缓存未及时清理
+`get_syllable_aux_set(syllable)` 使用 Rime `Memory`：
 
-**解决方案**: 前缀匹配结果不缓存，定期重启输入法
+1. 精确 `dict_lookup(syllable, false, 0)`。
+2. 精确有结果时遍历 `iter_dict()`，只收集单字候选的辅码。
+3. 精确结果没有单字时，fallback 到预测查询 `dict_lookup(syllable, true, 0)`。
+4. 展开首码、完整双码；全码模式额外加入次码。
+5. 只缓存精确匹配结果；预测结果不写长期缓存。
 
-### Q3: 辅码不显示？
+这样避免了简拼/前缀查询在不同上下文下污染缓存。
 
-**检查**:
-1. 辅码文件是否存在
-2. 触发键是否正确
-3. 候选词是否有辅码配置
+## 11. 智能指令
 
----
+| 指令 | 作用 |
+|---|---|
+| `a` | 左偏移 1 字 |
+| `s` | 左偏移 2 字；在长句功能码中也可作为修音前缀 |
+| `d` | 右偏移 1 字 |
+| `f` | 右偏移 2 字 |
+| `w` | 跳过当前首候选 |
+| `c/v/b/n` | 复制次数调整 |
+| `t` | 首候选简繁转换 |
+| `tXX` | 把首候选发送到本地 HTTP 接口 |
+| `rXX` | 把原始输入发送到本地 HTTP 接口 |
 
-## 12. 联系方式与参考
+外部请求依赖 `simplehttp` 和 `127.0.0.1:8080`。模块不可用时，基础辅码功能不受影响。
 
-- 原始项目: Rime 输入法
-- Lua 插件: librime-lua
-- 辅码格式: 详见 ZRM_Aux-code 配置文件
+## 12. 调试
+
+生产脚本写普通日志到 `<Rime 用户目录>/dic.log`。
+
+调试脚本额外写 JSON Lines 到 `<Rime 用户目录>/debug_breakpoint.log`，可用 `docs/log_parser.html` 查看。调试事件包括：
+
+- `session_start`
+- `memory_init`
+- `func_entry`
+- `parse_input_code`
+- `find_break_point_*`
+- `notifier_*`
+- `update_notifier`
+
+## 13. 当前限制
+
+- 断句、分心、修音都是低频纠偏能力，单次可能触发 `Memory:iter_dict()`，不应按普通热路径看待。
+- `preedit_prefix_cache` 是 composition 级缓存，composition 结束会清理。
+- `matchmode` 只有 `s` 被视为严格顺序；其他值都按全码兼容处理。
+- `aux_v2_debug.lua` 的日志字段可能多于生产脚本状态字段，文档以生产脚本行为为准。
