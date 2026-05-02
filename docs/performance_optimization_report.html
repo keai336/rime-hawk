@@ -1,0 +1,1017 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rime Lua 辅码脚本性能优化报告</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-soft: #f0f3f6;
+      --text: #1d252d;
+      --muted: #657180;
+      --line: #d8dee6;
+      --accent: #176b87;
+      --accent-2: #2d8f6f;
+      --warn: #a86500;
+      --risk: #b33a3a;
+      --good: #217a48;
+      --code-bg: #17212b;
+      --code-text: #e8eef4;
+      --shadow: 0 12px 32px rgba(20, 35, 50, 0.08);
+      font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.65;
+    }
+
+    header {
+      background: #10202c;
+      color: #f7fbff;
+      padding: 38px 28px 34px;
+      border-bottom: 6px solid var(--accent-2);
+    }
+
+    header .wrap,
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(28px, 4vw, 44px);
+      line-height: 1.16;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 0 0 18px;
+      font-size: 26px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 24px 0 10px;
+      font-size: 19px;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0 0 13px;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    main {
+      padding: 28px;
+    }
+
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      margin: 0 0 22px;
+      padding: 24px;
+    }
+
+    .lede {
+      color: #d8e7f2;
+      max-width: 900px;
+      font-size: 17px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      border: 1px solid rgba(255, 255, 255, 0.24);
+      border-radius: 16px;
+      padding: 4px 12px;
+      color: #e8f2fa;
+      background: rgba(255, 255, 255, 0.08);
+      font-size: 13px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 16px;
+    }
+
+    .metric {
+      grid-column: span 3;
+      background: var(--panel-soft);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 28px;
+      line-height: 1.1;
+      color: var(--accent);
+    }
+
+    .metric span {
+      display: block;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .finding {
+      border-left: 4px solid var(--accent);
+      background: #f7fafb;
+      padding: 14px 16px;
+      margin: 14px 0;
+      border-radius: 0 8px 8px 0;
+    }
+
+    .finding.high {
+      border-left-color: var(--risk);
+    }
+
+    .finding.medium {
+      border-left-color: var(--warn);
+    }
+
+    .finding.low {
+      border-left-color: var(--good);
+    }
+
+    .finding-title {
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .label {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 2px 9px;
+      margin-right: 8px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #fff;
+      vertical-align: 1px;
+    }
+
+    .p0 { background: var(--risk); }
+    .p1 { background: var(--warn); }
+    .p2 { background: var(--accent); }
+    .p3 { background: var(--good); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 4px;
+      font-size: 14px;
+    }
+
+    th,
+    td {
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #edf2f5;
+      color: #22313f;
+    }
+
+    td:first-child,
+    th:first-child {
+      width: 170px;
+    }
+
+    code {
+      font-family: Consolas, "Cascadia Mono", Menlo, monospace;
+      background: #edf2f5;
+      border: 1px solid #d8e1e8;
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-size: 0.94em;
+    }
+
+    pre {
+      overflow-x: auto;
+      background: var(--code-bg);
+      color: var(--code-text);
+      border-radius: 8px;
+      padding: 16px;
+      margin: 12px 0 4px;
+      font-size: 13px;
+    }
+
+    pre code {
+      background: transparent;
+      color: inherit;
+      border: 0;
+      padding: 0;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .flow div {
+      min-height: 86px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #f9fbfc;
+      position: relative;
+    }
+
+    .flow div:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      right: -9px;
+      top: 38px;
+      width: 8px;
+      height: 8px;
+      border-top: 2px solid var(--muted);
+      border-right: 2px solid var(--muted);
+      transform: rotate(45deg);
+      background: var(--bg);
+    }
+
+    .flow strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--accent);
+    }
+
+    .bar {
+      display: grid;
+      grid-template-columns: 160px 1fr 80px;
+      gap: 10px;
+      align-items: center;
+      margin: 10px 0;
+      font-size: 14px;
+    }
+
+    .bar-track {
+      background: #dde5eb;
+      border-radius: 999px;
+      height: 12px;
+      overflow: hidden;
+    }
+
+    .bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    }
+
+    .note {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .delta-pos,
+    .delta-neg,
+    .delta-neutral {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .delta-pos {
+      color: #fff;
+      background: var(--good);
+    }
+
+    .delta-neg {
+      color: #fff;
+      background: var(--risk);
+    }
+
+    .delta-neutral {
+      color: #26333d;
+      background: #dfe7ed;
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 860px) {
+      main,
+      header {
+        padding-left: 16px;
+        padding-right: 16px;
+      }
+
+      .metric {
+        grid-column: span 6;
+      }
+
+      .flow,
+      .two-col {
+        grid-template-columns: 1fr;
+      }
+
+      .flow div:not(:last-child)::after {
+        display: none;
+      }
+
+      .bar {
+        grid-template-columns: 1fr;
+        gap: 4px;
+      }
+    }
+
+    @media print {
+      body {
+        background: #fff;
+      }
+
+      header,
+      section {
+        box-shadow: none;
+      }
+
+      main {
+        padding: 12px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1>Rime Lua 辅码脚本性能优化报告</h1>
+      <p class="lede">基于 <code>aux_v2.lua</code> 的静态分析，重点评估候选过滤热路径、辅码表数据结构、Memory API 查询、缓存策略和 UTF-8 字符处理。报告偏向可执行的工程改造，不包含运行时 profiling 结果。</p>
+      <div class="meta">
+        <span class="tag">日期：2026-05-01</span>
+        <span class="tag">分支：codex-elegant-aux-trigger-fix</span>
+        <span class="tag">脚本：aux_v2.lua / aux_v2_debug.lua</span>
+        <span class="tag">样本辅码表：test5.txt，25,584 行</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>结论摘要</h2>
+      <div class="grid">
+        <div class="metric">
+          <strong>高</strong>
+          <span>最高收益：普通辅码筛选热路径的匹配结构和候选遍历</span>
+        </div>
+        <div class="metric">
+          <strong>中</strong>
+          <span>数据结构收益：辅码字符串改索引表或 bitset</span>
+        </div>
+        <div class="metric">
+          <strong>低</strong>
+          <span>微优化：UTF-8 子串、table.insert、重复 gsub/match</span>
+        </div>
+        <div class="metric">
+          <strong>先测</strong>
+          <span>建议先加采样计数器，再做结构重写</span>
+        </div>
+      </div>
+
+      <div class="finding high">
+        <div class="finding-title"><span class="label p0">P0</span>候选列表目前存在重复遍历，属于热路径结构性成本。</div>
+        <p><code>main1()</code> 的 <code>process_candidates()</code> 先遍历一次找首个候选并处理，再从头遍历一次处理所有候选。首候选会被重复进入 <code>main_main()</code>，依靠去重状态抵消输出，但计算成本仍然存在。</p>
+      </div>
+
+      <div class="finding low">
+        <div class="finding-title"><span class="label p2">P2</span><code>get_syllable_aux_set()</code> 的 <code>iter_dict()</code> 是低频路径的延迟尖刺，不是主吞吐瓶颈。</div>
+        <p>断句、修音、分心属于低频能力。这里的 <code>dict_lookup()</code> / <code>iter_dict()</code> 成本可能很高，但只在特定功能触发时出现；优化目标应是控制卡顿和重复扫描，不应抢在普通辅码筛选热路径前面。</p>
+      </div>
+
+      <div class="finding high">
+        <div class="finding-title"><span class="label p0">P0</span>辅码表运行时仍以字符串为主，普通筛选每次匹配都要扫描。</div>
+        <p><code>AuxFilter.aux_code[字] = "pe,xx"</code> 对展示友好，但热路径里 <code>AuxFilter.match()</code>、<code>isCharInFirstPosition()</code>、<code>fullAux()</code> 都需要从字符串恢复结构。建议保留展示字符串，同时新增专用索引。</p>
+      </div>
+
+      <div class="finding medium">
+        <div class="finding-title"><span class="label p1">频率权重</span>优化排序应以“每次按键都会走”的路径为主。</div>
+        <p>普通单码/双码辅码筛选是高频路径，候选迭代、辅码匹配、候选构造都应优先优化。断句、分心、修音虽然单次开销可能更大，但触发频率低，适合作为第二梯队做有界缓存和尖刺治理。</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>当前执行链路</h2>
+      <div class="flow">
+        <div><strong>输入解析</strong><span><code>Update_codes()</code> 拆 input/preedit，得到辅码尾段和前缀。</span></div>
+        <div><strong>候选迭代</strong><span><code>main1()</code> 遍历候选，进入 <code>main_main()</code>。</span></div>
+        <div><strong>辅码匹配</strong><span>单字走预计算，多字走 <code>fullAuxCache</code>。</span></div>
+        <div><strong>低频断句探路</strong><span><code>get_syllable_aux_set()</code> 经 Memory API 查音节可用辅码。</span></div>
+        <div><strong>候选产出</strong><span><code>candisub:new()</code> 裁剪 preedit/text，再 <code>yield()</code>。</span></div>
+      </div>
+
+      <h3>主要复杂度来源</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>位置</th>
+            <th>当前行为</th>
+            <th>复杂度/风险</th>
+            <th>建议方向</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>main1.process_candidates()</code></td>
+            <td>候选迭代两次，首候选进入处理两次。</td>
+            <td>候选越多，重复匹配、注释拼接、候选构造越多。</td>
+            <td>改单次遍历：第一次命中时记录 <code>firstcandi/rawpreedit</code>，同时继续处理后续候选。</td>
+          </tr>
+          <tr>
+            <td><code>get_syllable_aux_set()</code></td>
+            <td>对音节执行 <code>dict_lookup()</code> 后 <code>iter_dict()</code> 收集辅码集合。</td>
+            <td>断句/修音/分心相关路径低频，但字典规模和短音节预测匹配会放大单次卡顿。</td>
+            <td>作为第二梯队优化：增加有界 LRU；把精确和预测结果分 key 缓存；记录失败类型。</td>
+          </tr>
+          <tr>
+            <td><code>AuxFilter.match()</code></td>
+            <td>扫描 <code>{首码串, 次码串}</code> 判断匹配。</td>
+            <td>每个候选都可能扫字符串，候选列表长时明显。</td>
+            <td>用 char-set 表或 bitmask 表达首码、次码、双码组合。</td>
+          </tr>
+          <tr>
+            <td><code>candisub:new()</code></td>
+            <td>频繁 split preedit、transform preedit、构造临时候选。</td>
+            <td>候选越多，短生命周期 table 越多，GC 压力上升。</td>
+            <td>缓存 preedit 元数据和 prefix byte offsets；只在真正要输出时做转换。</td>
+          </tr>
+          <tr>
+            <td><code>utf8sub()</code></td>
+            <td>多处通过 <code>utf8.offset()</code> 取字符。</td>
+            <td>对长词/长句多次调用时重复扫描。</td>
+            <td>候选级 char array 缓存，复用首字、末字、第 N 字。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>性能与内存变化对比</h2>
+      <p>下表是静态推导对比，不是实测压测数据。这里按使用频率加权：普通辅码筛选是高频路径，断句、分心、修音是低频路径。符号说明：<code>N</code> 是当前轮候选数，<code>K</code> 是单字模式下为了找到第一个可用候选而跳过的候选数，<code>S</code> 是同一轮参与探路的音节数，<code>U</code> 是重复出现的唯一音节数。</p>
+
+      <h3>CPU / 延迟对比</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>优化项</th>
+            <th>当前成本</th>
+            <th>优化后成本</th>
+            <th>变化判断</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>候选单遍历</td>
+            <td>普通模式约 <code>N + 1</code> 次 <code>main_main()</code>；单字模式可能额外扫描 <code>K</code> 个候选。</td>
+            <td>稳定为 <code>N</code> 次候选处理；首候选不再重复进入匹配和候选构造。</td>
+            <td><span class="delta-pos">CPU 下降</span> 候选越多越明显；行为风险中等。</td>
+          </tr>
+          <tr>
+            <td>音节辅码 LRU</td>
+            <td>精确命中是 <code>O(1)</code>；预测匹配不缓存，重复短音节可能反复 <code>dict_lookup + iter_dict</code>。</td>
+            <td>同一 cache window 内预测匹配也可 <code>O(1)</code> 命中；重复音节从 <code>S</code> 次扫描降到约 <code>U</code> 次扫描。</td>
+            <td><span class="delta-pos">低频尖刺下降</span> 对日常普通筛选帮助有限，主要改善断句/修音触发时的卡顿。</td>
+          </tr>
+          <tr>
+            <td>辅码索引表</td>
+            <td><code>AuxFilter.match()</code> 扫描首码串/次码串，单候选约 <code>O(候选字数或辅码数)</code>。</td>
+            <td>表索引或 bitmask 判断，单候选接近 <code>O(1)</code>。</td>
+            <td><span class="delta-pos">CPU 下降</span> 候选列表长、词组多时更明显。</td>
+          </tr>
+          <tr>
+            <td>词级辅码缓存改索引</td>
+            <td>首次 <code>fullAux()</code> 按字遍历并拼字符串；后续仍要扫描字符串匹配。</td>
+            <td>首次按字聚合索引；后续直接集合判断。</td>
+            <td><span class="delta-pos">CPU 下降</span> 高频多字词收益稳定。</td>
+          </tr>
+          <tr>
+            <td>preedit 元数据缓存</td>
+            <td>多处 <code>split_pinyin()</code>、<code>sum_lengths()</code>、<code>utf8sub()</code> 重复拆解。</td>
+            <td>复用 <code>parts/count/byte_prefix</code>，裁剪时少做重复扫描。</td>
+            <td><span class="delta-neutral">收益偏场景化</span> 长句、修音、断句更明显；普通短词收益有限。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>内存对比</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>优化项</th>
+            <th>当前内存形态</th>
+            <th>优化后内存形态</th>
+            <th>变化判断</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>辅码索引表</td>
+            <td><code>aux_code[字] = "pe,xx"</code>，展示和匹配共用字符串；另有 <code>fullAux_precomputed</code>。</td>
+            <td>短期并存 <code>aux_display</code> 和 <code>char_aux_index</code>；若用表集合，启动内存会上升；若用 bitmask，可控制为每字少量整数。</td>
+            <td><span class="delta-neg">内存上升</span> 换取匹配 CPU 下降。建议稳定后替代旧 <code>fullAux_precomputed</code>，避免双份结构长期并存。</td>
+          </tr>
+          <tr>
+            <td>音节辅码 LRU</td>
+            <td><code>syllable_aux_cache</code> 缓存精确结果；预测结果不缓存，内存低但 CPU 波动大。</td>
+            <td>新增有界 LRU，例如 128/256 项；预测结果有内存上限。</td>
+            <td><span class="delta-neutral">内存小幅上升</span> 但从“重复扫描”换成“固定容量缓存”。</td>
+          </tr>
+          <tr>
+            <td>词级缓存限容</td>
+            <td><code>fullAuxCache</code> 按词增长，当前没有容量上限。</td>
+            <td>改为 LRU 后内存有上限；单项若存索引表会比字符串更大。</td>
+            <td><span class="delta-pos">峰值可控</span> 单项变大，但总体可通过容量压住。</td>
+          </tr>
+          <tr>
+            <td>preedit 元数据缓存</td>
+            <td><code>pinyin_cache</code> 缓存可变数组，长期增长且有污染风险。</td>
+            <td>缓存只读元数据；可加容量上限；调用方修改前复制。</td>
+            <td><span class="delta-neutral">内存持平或小幅上升</span> 主要收益是稳定性和减少重复拆分。</td>
+          </tr>
+          <tr>
+            <td>性能计数器</td>
+            <td>release 无计数器，debug 有大量 JSON 日志。</td>
+            <td>release 只保留可关闭的轻量计数表；debug 才输出详细日志。</td>
+            <td><span class="delta-neutral">可忽略</span> 计数器必须默认低开销，避免影响输入延迟。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>建议的可视化指标</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>指标</th>
+            <th>优化前应看到</th>
+            <th>优化后应看到</th>
+            <th>说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>main_main_calls / round</code></td>
+            <td>普通模式约 <code>N + 1</code>。</td>
+            <td>约 <code>N</code>。</td>
+            <td>验证候选单遍历是否生效。</td>
+          </tr>
+          <tr>
+            <td><code>iter_dict_scan / low_freq_action</code></td>
+            <td>断句/修音/分心触发时，重复音节或预测探路可能多次扫描。</td>
+            <td>同一低频操作内的重复音节明显下降。</td>
+            <td>验证 LRU 和轮次缓存是否控制偶发卡顿。</td>
+          </tr>
+          <tr>
+            <td><code>aux_match_scan_chars</code></td>
+            <td>随候选数和词长增长。</td>
+            <td>趋近于 0，改由集合/bitmask 命中。</td>
+            <td>验证辅码索引表是否替代字符串扫描。</td>
+          </tr>
+          <tr>
+            <td><code>cache_entries</code></td>
+            <td><code>fullAuxCache</code>、<code>pinyin_cache</code> 可持续增长。</td>
+            <td>LRU 项数不超过配置上限。</td>
+            <td>验证内存峰值是否可控。</td>
+          </tr>
+          <tr>
+            <td><code>lua_gc_kb</code></td>
+            <td>长句和大量候选时容易抖动。</td>
+            <td>引入索引后启动内存可能上升，但输入过程 GC 抖动应下降。</td>
+            <td>用 <code>collectgarbage("count")</code> 抽样，不要每次按键都频繁调用。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="finding medium">
+        <div class="finding-title"><span class="label p1">关键取舍</span>最值得做的是“用一点固定内存换热路径稳定”。</div>
+        <p>辅码索引表是主线，因为普通筛选每次按键都会用；LRU 是低频能力的尖刺治理，容量要小。对输入法脚本来说，高频路径应该用固定内存换稳定低延迟；低频路径只做有界缓存，避免为偶发功能付出过高常驻内存。</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>优化优先级</h2>
+      <div class="bar">
+        <span>辅码索引表</span>
+        <div class="bar-track"><div class="bar-fill" style="width: 94%"></div></div>
+        <span>高频主线</span>
+      </div>
+      <div class="bar">
+        <span>候选单遍历</span>
+        <div class="bar-track"><div class="bar-fill" style="width: 86%"></div></div>
+        <span>高频主线</span>
+      </div>
+      <div class="bar">
+        <span>词级辅码索引缓存</span>
+        <div class="bar-track"><div class="bar-fill" style="width: 76%"></div></div>
+        <span>高频词组</span>
+      </div>
+      <div class="bar">
+        <span>音节辅码 LRU</span>
+        <div class="bar-track"><div class="bar-fill" style="width: 44%"></div></div>
+        <span>低频尖刺</span>
+      </div>
+      <div class="bar">
+        <span>preedit 元数据缓存</span>
+        <div class="bar-track"><div class="bar-fill" style="width: 38%"></div></div>
+        <span>场景收益</span>
+      </div>
+      <div class="bar">
+        <span>字符串/局部变量微调</span>
+        <div class="bar-track"><div class="bar-fill" style="width: 28%"></div></div>
+        <span>收益低</span>
+      </div>
+      <p class="note">以上按日常使用频率加权排序，不是压测数字。普通辅码筛选是主线；断句、分心、修音相关优化主要用于减少偶发卡顿。</p>
+    </section>
+
+    <section>
+      <h2>数据结构建议</h2>
+
+      <h3>1. 分离展示数据和匹配索引</h3>
+      <p>当前 <code>AuxFilter.aux_code</code> 同时承担展示和匹配。建议加载辅码表时生成两套结构：展示字符串继续用于 comment，匹配索引用于热路径。</p>
+      <table>
+        <thead>
+          <tr>
+            <th>结构</th>
+            <th>用途</th>
+            <th>建议值</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>aux_display[char]</code></td>
+            <td>候选注释展示。</td>
+            <td><code>"pe,xx"</code>，保持现状。</td>
+          </tr>
+          <tr>
+            <td><code>char_aux_index[char]</code></td>
+            <td>单字快速匹配。</td>
+            <td><code>{ first = {p=true}, second = {e=true}, pair = {pe=true} }</code></td>
+          </tr>
+          <tr>
+            <td><code>word_aux_cache[word]</code></td>
+            <td>多字词按需聚合。</td>
+            <td><code>{ firstSet, secondSet, pairSet, firstSeq, secondSeq }</code></td>
+          </tr>
+          <tr>
+            <td><code>syllable_aux_cache[key]</code></td>
+            <td>断句/探路音节集合。</td>
+            <td>区分 <code>exact:ji</code>、<code>pred:j</code>、<code>miss:...</code>，使用 LRU。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <pre><code>-- 建议形态：加载辅码时一次构建
+char_aux_index["踩"] = {
+  first = { p = true },
+  second = { e = true },
+  pair = { pe = true },
+  display = "pe"
+}
+
+local function match_aux_index(index, aux)
+  if not index or aux == "" then return aux == "" end
+  if #aux == 1 then
+    return index.first[aux] or (AuxFilter.matchmode == 0 and index.second[aux])
+  end
+  return index.pair[aux] or (AuxFilter.matchmode == 0 and index.pair[aux:reverse()])
+end</code></pre>
+
+      <p>如果目标 Rime Lua 环境确认支持稳定 bit 操作，可以把 <code>first/second</code> 从表进一步压成 26 位 bitmask。否则表结构更稳，且已经能消除大量字符串扫描。</p>
+
+      <h3>2. 把 <code>fullAuxCache</code> 从字符串串联改为聚合索引</h3>
+      <p>现在多字词首次命中时会调用 <code>AuxFilter.fullAux()</code>，按字符拼接首码串和次码串。建议多字词缓存直接聚合单字索引，避免每次 <code>AuxFilter.match()</code> 再扫描字符串。</p>
+      <pre><code>word_aux_cache[word] = {
+  first = { h = true, j = true },
+  second = { h = true, b = true },
+  pair = { hh = true, jb = true },
+  len = 2
+}</code></pre>
+
+      <h3>3. 为预测匹配加有界 LRU，而不是完全不缓存</h3>
+      <p>现有代码不缓存预测匹配，原因是避免不同上下文结果不稳定和内存膨胀。这个判断合理，但可以更细：预测结果按 <code>pred:&lt;syllable&gt;</code> 缓存到固定容量，例如 128 或 256 项。这样短时间连续探路不会反复扫字典，内存也可控。</p>
+      <pre><code>local syllable_aux_lru = {
+  max = 256,
+  map = {},
+  order = {}
+}
+
+-- key 示例：
+-- exact:ji
+-- pred:j
+-- miss_exact:xyz</code></pre>
+
+      <h3>4. 缓存 preedit 元数据而不是缓存可变数组</h3>
+      <p><code>split_pinyin()</code> 缓存返回数组，历史上已经出现过“调用方修改数组污染缓存”的问题。建议缓存不可变元数据，调用方需要变更时显式复制。</p>
+      <pre><code>preedit_meta_cache["han xin"] = {
+  parts = {"han", "xin"},
+  byte_prefix = {3, 6},
+  count = 2
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>高频热路径和低频尖刺改造建议</h2>
+
+      <div class="finding high">
+        <div class="finding-title"><span class="label p0">步骤 1</span>将普通辅码匹配从字符串扫描迁移到索引表。</div>
+        <p>这是普通单码/双码筛选每次按键都会走的路径，优先级应高于断句和分心。先保留现有 <code>AuxFilter.fullAux_precomputed</code> 和 <code>fullAuxCache</code>，新增 <code>char_aux_index</code> / <code>word_aux_cache</code> 并让 <code>main_main()</code> 优先使用新索引。稳定后再删除旧结构，避免长期双份内存。</p>
+      </div>
+
+      <div class="finding high">
+        <div class="finding-title"><span class="label p0">步骤 2</span>把候选处理改为单遍历。</div>
+        <p>候选迭代也是普通筛选高频路径。当前第一遍找到首候选并调用 <code>main_main()</code>，第二遍再次处理全部候选。可以改为一遍处理，首次符合条件时记录 <code>firstcandi/rawpreedit</code>。</p>
+        <pre><code>local firstcandi, rawpreedit
+for cand in input:iter() do
+  if not need_filter or #split_pinyin(cand.preedit) == 1 then
+    if not firstcandi then
+      firstcandi, rawpreedit = cand, cand.preedit
+    end
+    main_main(env, cand)
+  end
+end</code></pre>
+        <p class="note">需要回归单字模式、双码辅码、首候选去重状态；分心路径只作为兼容回归项，不应主导设计。</p>
+      </div>
+
+      <div class="finding low">
+        <div class="finding-title"><span class="label p2">步骤 3</span>把 <code>get_syllable_aux_set()</code> 的缓存策略改为小容量有界缓存。</div>
+        <p>这一步服务于断句、修音、分心等低频能力。精确匹配可以继续永久缓存；预测匹配和失败结果建议使用小容量 LRU 或帧内缓存，目标是避免偶发功能触发时卡顿，而不是提升日常输入主路径吞吐。</p>
+        <table>
+          <thead>
+            <tr>
+              <th>缓存层</th>
+              <th>生命周期</th>
+              <th>适用内容</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>永久进程缓存</td>
+              <td>进程级</td>
+              <td>精确音节成功结果、明确无结果的精确音节。</td>
+            </tr>
+            <tr>
+              <td>LRU 缓存</td>
+              <td>进程级有容量</td>
+              <td>预测匹配结果，例如短音节、简拼探路；建议容量从 64 或 128 起步。</td>
+            </tr>
+            <tr>
+              <td>轮次缓存</td>
+              <td>每次 <code>func()</code> 重置</td>
+              <td>同一候选列表中重复出现的 preedit 音节。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="finding medium">
+        <div class="finding-title"><span class="label p1">步骤 4</span>减少 <code>candisub:new()</code> 的 table 分配。</div>
+        <p><code>slice()</code>、<code>transform_preedit()</code>、<code>split_pinyin()</code> 组合会产生短生命周期数组。普通短词收益有限，长句、修音、断句更明显；可以在完成主路径优化后，再缓存 <code>preedit + len</code> 的转换结果，或者只在候选最终要 <code>yield</code> 时再构造 preedit。</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>可观测性和压测方案</h2>
+      <p>这类输入法脚本性能需要在真实 Rime 运行环境中测。建议先加轻量计数器，不要一上来改大量结构，否则容易把行为回归和性能回归混在一起。</p>
+      <div class="two-col">
+        <div>
+          <h3>建议计数器</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>计数项</th>
+                <th>意义</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>cand_seen</code></td>
+                <td>每轮进入候选过滤的候选数。</td>
+              </tr>
+              <tr>
+                <td><code>cand_yielded</code></td>
+                <td>最终输出候选数。</td>
+              </tr>
+              <tr>
+                <td><code>syllable_lookup</code></td>
+                <td>Memory API 查音节次数。</td>
+              </tr>
+              <tr>
+                <td><code>iter_dict_scan</code></td>
+                <td>触发字典迭代次数。</td>
+              </tr>
+              <tr>
+                <td><code>fullAux_miss</code></td>
+                <td>多字词辅码缓存 miss 次数。</td>
+              </tr>
+              <tr>
+                <td><code>tail_candidate_dropped</code></td>
+                <td>尾段候选拦截次数。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div>
+          <h3>建议场景</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>场景</th>
+                <th>关注指标</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>普通单码/双码筛选</td>
+                <td>候选遍历次数、匹配耗时。</td>
+              </tr>
+              <tr>
+                <td>长词断句</td>
+                <td><code>get_syllable_aux_set()</code> 命中率。</td>
+              </tr>
+              <tr>
+                <td>简拼/预测匹配</td>
+                <td>预测缓存收益和内存增长。</td>
+              </tr>
+              <tr>
+                <td>未配置 initials 的吞键路径</td>
+                <td>尾段候选拦截和 commit 正确性。</td>
+              </tr>
+              <tr>
+                <td>高频词组连续输入</td>
+                <td><code>fullAuxCache</code> 命中率。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <pre><code>-- 低侵入计数器示例
+S.perf = S.perf or {}
+S.perf.cand_seen = (S.perf.cand_seen or 0) + 1
+
+local t0 = os.clock()
+local fuset = get_syllable_aux_set(value)
+S.perf.syllable_lookup_ms = (S.perf.syllable_lookup_ms or 0) + (os.clock() - t0) * 1000</code></pre>
+    </section>
+
+    <section>
+      <h2>实施路线</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>阶段</th>
+            <th>改动</th>
+            <th>验证重点</th>
+            <th>风险</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>阶段 A</td>
+            <td>加入性能计数器；debug 版输出汇总日志。</td>
+            <td>确认真实热点排序。</td>
+            <td>低。注意 debug 默认开关不要影响 release。</td>
+          </tr>
+          <tr>
+            <td>阶段 B</td>
+            <td>新增 <code>char_aux_index</code> / <code>word_aux_cache</code>，普通筛选优先走索引匹配。</td>
+            <td>单字、词组、宽松匹配模式、辅码提示展示。</td>
+            <td>中高。短期可能增加常驻内存，稳定后应替代旧缓存结构。</td>
+          </tr>
+          <tr>
+            <td>阶段 C</td>
+            <td>候选单遍历，减少重复 <code>main_main()</code>。</td>
+            <td>候选顺序、首候选去重、普通单码/双码筛选。</td>
+            <td>中。状态机依赖 <code>S.counter</code>，需重点回归。</td>
+          </tr>
+          <tr>
+            <td>阶段 D</td>
+            <td>音节辅码小容量 LRU 和轮次缓存。</td>
+            <td>低频断句、修音、简拼探路正确性。</td>
+            <td>中。预测结果缓存必须有容量和 key 区分，避免低频功能占太多常驻内存。</td>
+          </tr>
+          <tr>
+            <td>阶段 E</td>
+            <td>preedit 元数据缓存、UTF-8 字符数组缓存。</td>
+            <td>长句断句、修音、候选裁剪；普通短词只抽样验证。</td>
+            <td>中。缓存对象必须不可变或复制后修改。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>具体代码级建议</h2>
+      <h3>短期可做</h3>
+      <ul>
+        <li>加载辅码表时构建 <code>char_aux_index</code>，让普通筛选热路径使用布尔集合或 bitmask 匹配。</li>
+        <li>将 <code>fullAuxCache</code> 改为词级聚合索引，匹配不再扫描字符串。</li>
+        <li>把 <code>main1.process_candidates()</code> 的双遍历改成单遍历。</li>
+        <li>把 <code>fullAux()</code> 里的字符串拼接改为 table 收集后 <code>table.concat()</code>。</li>
+      </ul>
+
+      <h3>中期重构</h3>
+      <ul>
+        <li>在 <code>get_syllable_aux_set()</code> 内增加小容量 LRU 和本轮查询缓存，服务低频断句/修音/分心路径。</li>
+        <li>让 <code>parseIntelligentCode()</code> 返回更多派生字段，减少下游重复解析 <code>funccode</code>。</li>
+        <li>把 <code>table.insert()</code> 热路径替换为 <code>t[#t + 1] = v</code>。</li>
+        <li>把 <code>split_pinyin()</code> 的返回对象视为只读，修音分支统一复制后修改。</li>
+      </ul>
+
+      <h3>暂不建议</h3>
+      <ul>
+        <li>不建议先做大面积局部变量缓存和微型字符串优化。它们容易制造噪音，收益通常低于结构性改动。</li>
+        <li>不建议无上限缓存预测匹配结果。短音节会制造大量上下文相关结果。</li>
+        <li>不建议把 debug 版作为性能基准。debug 版日志和 JSON 序列化会显著改变耗时。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>风险清单</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>风险</th>
+            <th>说明</th>
+            <th>控制方式</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>状态机顺序变化</td>
+            <td>候选单遍历会改变 <code>S.counter</code>、<code>S.one_aux_firstcode</code> 被设置的时机。</td>
+            <td>先覆盖普通单码/双码、单字/词组；主动/被动分心作为低频兼容回归样例。</td>
+          </tr>
+          <tr>
+            <td>预测缓存错误复用</td>
+            <td>预测匹配结果可能与上下文有关。</td>
+            <td>缓存 key 区分 exact/predictive；预测缓存有容量；必要时加 schema/version salt。</td>
+          </tr>
+          <tr>
+            <td>索引结构和展示结构不一致</td>
+            <td>辅码字符串和新索引同时存在时可能构建不一致。</td>
+            <td>单一加载函数同时产出两者；debug 模式抽样校验。</td>
+          </tr>
+          <tr>
+            <td>缓存数组被修改</td>
+            <td><code>split_pinyin()</code> 已有历史污染问题。</td>
+            <td>缓存对象只读约定；修改前复制；命名上区分 <code>meta.parts</code> 和 <code>fresh_parts</code>。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>建议验收标准</h2>
+      <ul>
+        <li>普通辅码筛选每轮候选遍历次数从“两遍”降为“一遍”。</li>
+        <li>低频长句断句场景中 <code>iter_dict()</code> 调用次数可解释，重复音节命中小容量缓存。</li>
+        <li>辅码匹配函数不再对候选的首码/次码字符串做线性扫描。</li>
+        <li>debug/release 业务分支保持一致，debug 只增加观测逻辑。</li>
+        <li>未配置 <code>speller/initials</code> 的吞键路径仍能正确 commit，不出现尾段候选污染。</li>
+      </ul>
+      <p class="note">本报告是静态分析报告，建议下一步先做阶段 A 的计数器，再根据实际数据决定是否进入数据结构重构。</p>
+    </section>
+  </main>
+</body>
+</html>

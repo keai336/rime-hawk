@@ -1,247 +1,235 @@
 # 核心数据流图解
 
-> 辅码插件的工作流程和数据转换过程
+> 对照当前 `aux_v2.lua`。重点是输入解析、引导键防吞噬、普通辅码筛选、分心、断句和修音。
 
----
+## 1. 主入口
 
-## 1. 主入口函数调用链
-
-```
+```text
 用户按键
   ↓
-Rime Engine 调用 lua_filter
+Rime 调用 lua_filter
   ↓
 AuxFilter.func(input, env)
   ↓
-┌─────────────────────────────────────────────────────────────────┐
-│  1. Update_codes(ctx)  — 解析输入字符串                          │
-│     input: "zhongguo;vv;"                                       │
-│     → S.inputCode = "zhongguo;vv;"                              │
-│     → S.removeAuxInput = "zhongguo"                             │
-│     → S.auxStr = ""                                             │
-│                                                                 │
-│  2. 模式匹配                                                    │
-│     ┌──────────────┬──────────────────┬──────────────────────┐  │
-│     │ "^[^;]+;     │ "^[^;]+;         │ 其他                 │  │
-│     │  [%a,]*$"    │  %a*;+%a*$"      │                      │  │
-│     │              │                  │                      │  │
-│     │ main1()      │ longcandimodify()│ defaultmain()        │  │
-│     │              │                  │                      │  │
-│     │ 普通辅码     │ 断句+修音         │ 透传                 │  │
-│     └──────────────┴──────────────────┴──────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 2. 辅码筛选流程 (main1)
-
-```
-输入: "zh;vv"
+初始化/清理当前轮 S 状态
   ↓
-process_input()
-  → S.auxStr = "vv"
+AuxFilter.Update_codes(ctx)
+  ↓
+输入形态分发
+```
+
+分发顺序：
+
+```text
+只有引导键
+  → return，不产出候选
+
+拼音;辅码
+  → main1()
+
+拼音;辅码`
+  → switch_single_char() → main1()
+
+拼音;辅码;功能
+  → longcandimodify()
+
+其他
+  → defaultmain()
+```
+
+## 2. 输入解析与防吞噬
+
+当前修复的核心在 `Update_codes()`：
+
+```text
+context.input
+  ↓ transform_input_code()
+S.inputCode
+  ↓ split_first_plain(input, trigger)
+S.removeAuxInput = 第一个引导键前的输入
+S.raw_tail       = 第一个引导键后的尾部
+S.has_trigger   = 是否包含引导键
+```
+
+preedit 同步处理：
+
+```text
+context:get_preedit().text
+  ↓ transform_input_code()
+S.precode
+  ↓ split_first_plain(preedit, trigger)
+
+preedit 仍含引导键：
+  S.removeAuxprecode = preedit_prefix
+  preedit_prefix_cache[input_prefix] = preedit_prefix
+
+preedit 不含引导键：
+  S.removeAuxprecode =
+    preedit_prefix_cache[input_prefix]
+    或 strip_ascii_tail_leak(preedit_prefix, raw_tail)
+```
+
+这解决了最近的引导键吞噬问题：Rime 有时会让 `context.input` 和 `preedit` 对引导键的表现不同，旧逻辑只看一边，选中后容易恢复错输入。
+
+## 3. 普通辅码筛选
+
+```text
+输入: cai;p
+
+S.raw_tail = "p"
+  ↓
+main1.process_input()
+  → S.auxStr = "p"
   → S.funccode = ""
   ↓
-process_candidates()
-  → 遍历所有候选词
-  → 对每个候选词执行 main_main(env, cand)
-      ↓
-      ┌─────────────────────────────────────────────┐
-      │ main_main()                                  │
-      │                                              │
-      │ 1. 获取候选词的辅码                          │
-      │    ftext = "中"                               │
-      │    auxCodes = aux_code["中"] → "ay"           │
-      │    fullAuxCodes = fullAux("中") → {"a",""}    │
-      │                                              │
-      │ 2. 匹配辅码                                  │
-      │    match(fullAuxCodes, "vv") → false          │
-      │    → 不输出此候选词                          │
-      │                                              │
-      │ 1. 获取候选词的辅码                          │
-      │    ftext = "重"                               │
-      │    auxCodes = aux_code["重"] → "vv,...,"      │
-      │    fullAuxCodes = fullAux("重") → {"v","v"}   │
-      │                                              │
-      │ 2. 匹配辅码                                  │
-      │    match(fullAuxCodes, "vv") → true           │
-      │    → yield_candisub(cand) → 输出              │
-      └─────────────────────────────────────────────┘
+遍历候选
+  ↓
+main_main(env, cand)
+  ↓
+候选文本查辅码
+  ├─ 单字: fullAux_precomputed
+  └─ 多字: fullAuxCache 或 fullAux()
+  ↓
+AuxFilter.match(fullAuxCodes, S.auxStr)
+  ↓
+命中则 yield_candisub()
 ```
 
----
+候选输出前还会处理：
 
-## 3. 断句流程 (longcandimodify)
+- 辅码注释。
+- 去重。
+- `w` 跳过首候选。
+- `c/v/b/n` 复制。
+- `t` 简繁转换或外部接口转换。
+- `rXX` 把原始输入发给外部接口。
 
-```
-输入: "zhongguo;vv;"
-  ↓
-get_first_candidate()
-  → "中国", preedit = "zhong guo"
-  ↓
-parse_input_code()
-  → auxcode = "vv"
-  → branchmark = 1 (断句模式)
-  ↓
-process_offsets()
-  → inputspls = ["zhong", "guo"]
-  → ficompensate = 2 (候选词字数)
-  ↓
-find_break_point(inputspls, "vv")
-  ↓
-  ┌──────────────────────────────────────────────────┐
-  │ 遍历音节:                                        │
-  │                                                  │
-  │ index=1, syllable="zhong", zi="中"               │
-  │   → get_syllable_aux_set("zhong")                │
-  │   → fuset = {a:true, v:true, ...}                │
-  │   → combmath("vv", fuset) → 检查 fuset["vv"]     │
-  │   → false（zhong 的辅码不含 vv）                 │
-  │                                                  │
-  │ index=2, syllable="guo", zi="国"                 │
-  │   → get_syllable_aux_set("guo")                  │
-  │   → fuset = {l:true, v:true, vv:true, ...}       │
-  │   → combmath("vv", fuset) → 检查 fuset["vv"]     │
-  │   → true!（guo 的辅码包含 vv）                   │
-  │   → ficompensate = 2, matchedmark = true         │
-  │   → break                                       │
-  └──────────────────────────────────────────────────┘
-  ↓
-ficompensate = 2 - 1 = 1
-  ↓
-candisub:new(firstcandi, ficompensate=1)
-  → 截取前1个字: "中"
-  ↓
-yield("中")
+## 4. 二字词分心
+
+二字词双码先检查首字：
+
+```text
+候选 = "心仪"
+S.auxStr = "jb"
+
+首字 "心" 是否可由 j 命中
+  ├─ 否 → 拦截
+  └─ 是 → 继续检查第二字
+
+第二字 "仪" 是否可由 b 命中
+  ├─ 是，普通双码 → 输出 ** 标记
+  ├─ 是，主动分心 → 输出 ⇐ 标记
+  └─ 否，但首字已锁定 → 进入潜在分心
 ```
 
----
+潜在分心会做前瞻探路：
 
-## 4. 修音流程 (longcandimodify, branchmark=2)
-
-```
-输入: "zvjxgruz;ko;sge"
-                              ↑ 修音标记
+```text
+取第二个音节
   ↓
-parse_input_code()
-  → auxcode = "ko"
-  → ybmodif = "ge"（s后面的部分）
-  → branchmark = 2 (修音模式)
+get_syllable_aux_set(第二音节)
   ↓
-find_break_point()
-  → ficompensate = 3 (匹配到的断点位置)
-  ↓
-修音分支 (branchmark == 2):
-  ↓
-  ┌──────────────────────────────────────────────────┐
-  │ [V2 修复] 创建副本                               │
-  │                                                  │
-  │ inputspls = ["zv","jx","g","ruz"]  (缓存数组)    │
-  │                  ↑                              │
-  │            不能直接修改这个！                     │
-  │                                                  │
-  │ fresh_spls = ["zv","jx","g","ruz"]  (新数组)     │
-  │                    ↑                             │
-  │            可以安全修改                           │
-  └──────────────────────────────────────────────────┘
-  ↓
-target_idx = ficompensate + 1 = 4
-  ↓
-[安全检查] target_idx 是否越界
-  ↓
-wrongyb = fresh_spls[4]  → "ruz"
-fresh_spls[4] = "ge"     → 替换
-  ↓
-inputcode2 = "zvjxge" + table.concat
-  ↓
-S.ybmodifiedcode = "zvjxge;"
-  ↓
-yield("ruz->ge")  → 显示修改提示
+combmath(第二码, 音节辅码集合)
+  ├─ 命中 → 保留 *x / ✂ 候选
+  └─ 不命中 → 拦截，避免误导
 ```
 
----
+主动分心由占位符触发，例如 `xinyi;hj,`。
 
-## 5. 缓存策略
+## 5. 长句断句
 
-```
-┌────────────────────────────────────────────────────────┐
-│                   syllable_aux_cache                    │
-│                                                        │
-│  ┌─────────────┐    ┌─────────────┐                    │
-│  │ "zhong"     │    │ "guo"       │                    │
-│  │ ─────────── │    │ ─────────── │                    │
-│  │ 精确匹配    │    │ 精确匹配    │  ← 缓存 ✅        │
-│  │ 缓存: true  │    │ 缓存: true  │                    │
-│  └─────────────┘    └─────────────┘                    │
-│                                                        │
-│  ┌─────────────┐                                       │
-│  │ "q"         │    前缀匹配                           │
-│  │ ─────────── │    结果不缓存 ← 不缓存 ❌            │
-│  │ 每次重新查询│                                       │
-│  └─────────────┘                                       │
-│                                                        │
-│  策略:                                                 │
-│  - 精确匹配 → 缓存（可复用）                           │
-│  - 前缀匹配 → 不缓存（避免内存爆炸）                   │
-│  - 缓存失效 → 进程重启时自动清除                       │
-└────────────────────────────────────────────────────────┘
+```text
+输入: wodewuliiglewodebdbi;du;
+
+S.raw_tail = "du;"
+  ↓
+parse_long_tail(raw_tail, ";")
+  → auxcode = "du"
+  → funccode = ""
+  ↓
+取首候选和 preedit 音节数组
+  ↓
+find_break_point(inputspls, "du")
+  ↓
+逐音节查询 get_syllable_aux_set()
+  ↓
+combmath("du", fuset)
+  ↓
+命中后设置 S.ficompensate
+  ↓
+yield 截断候选
 ```
 
----
+连续多个引导键会增加跳过次数，用于定位后续命中点。
 
-## 6. 配置参数流
+## 6. 修音
 
+```text
+输入: zvjxgruz;wk;sge
+
+parse_long_tail()
+  → auxcode = "wk"
+  → funccode = "sge"
+  → ybmodif = "ge"
+  ↓
+find_break_point() 定位错音节附近
+  ↓
+branchmark = 2
+  ↓
+复制 inputspls 到 fresh_spls
+  ↓
+检查 target_idx 是否越界
+  ↓
+fresh_spls[target_idx] = "ge"
+  ↓
+S.ybmodifiedcode = S.transdcodei .. table.concat(fresh_spls) .. trigger
+  ↓
+选中提示候选后 longcandimodify_ybnotifier() 重写 ctx.input
 ```
-YAML 配置:
-  lua_filter@aux_v2_debug@ZRM_Aux-code@on@;@`@,@s
-                     │              │   │  │  │  │
-                     ↓              ↓   ↓  ↓  ↓  ↓
-              ┌──────────┐   ┌─────┐  │  │  │  │
-              │ path =   │   │showor│  │  │  │  │
-              │ ZRM_     │   │ = on│  │  │  │  │
-              │ Aux-code │   └─────┘  │  │  │  │
-              └──────────┘   ┌────────┘  │  │  │
-                             │trigger = ;│  │  │
-                             └───────────┘  │  │
-                             ┌──────────────┘  │
-                             │switch = `      │  │
-                             └────────────────┘  │
-                             ┌───────────────────┘
-                             │ph = ,          matchmode = s
-                             └─────────────────────────────┐
-                                                           │
-                             matchmode == "s" → 1 (简码模式)
-                             matchmode == "m" → 0 (全码模式)
+
+这里不能直接改 `inputspls`，因为它可能来自 `split_pinyin()` 缓存。
+
+## 7. 选中后的输入恢复
+
+```text
+select_notifier
+  ↓
+S.notifiermark
+  ├─ 1: main1_notifier()
+  ├─ 2: longcandimodify_notifier()
+  └─ 3: longcandimodify_ybnotifier()
 ```
 
----
+普通辅码：
 
-## 7. 智能指令解析
-
+```text
+有已转换输入 → ctx.input = removeAuxInput .. trigger .. aux_left
+否则         → ctx.input = removeAuxInput
 ```
-输入: "zhongguo;vv;adf"
-                    ↑↑↑
-                    ││└─ f → rightcompen += 2
-                    │└── d → rightcompen += 1
-                    └─── a → leftcompen += 1
 
-解析结果:
-  auxcode = "vv"
-  funccode = "adf"
-  leftcompen = 1
-  rightcompen = 3
+长句断句：
 
-  ficompensate = 原始值 + min(0, rightcompen - leftcompen)
-               = 原始值 + min(0, 3 - 1)
-               = 原始值 + min(0, 2)
-               = 原始值 + 0
-               = 原始值
-
-其他指令:
-  w → skipc += 1    (跳过候选)
-  c → dupc += 1     (复制次数+1)
-  v → dupc *= 2     (复制次数×2)
-  tXX → transor=true, trans_target=XX  (翻译)
-  rXX → rawor=true, raw_target=XX      (原始翻译)
+```text
+有已转换输入 → ctx.input = removeAuxInput .. trigger .. auxcode
+否则         → ctx.input = removeAuxInput
 ```
+
+修音：
+
+```text
+ctx.input = S.ybmodifiedcode
+```
+
+## 8. 缓存和生命周期
+
+| 缓存 | 生命周期 | 用途 |
+|---|---|---|
+| `AuxFilter.aux_code` | 进程级 | 字到辅码表 |
+| `AuxFilter.fullAux_precomputed` | 进程级 | 单字辅码 O(1) 查询 |
+| `fullAuxCache` | 进程级 | 多字词辅码按需缓存 |
+| `pinyin_cache` | 进程级 | preedit 空格切分结果 |
+| `syllable_aux_cache` | 进程级 | 精确音节到辅码集合 |
+| `preedit_prefix_cache` | composition 级 | 防止引导键吞噬时丢失 preedit 前缀 |
+| `S.yieldset` / `S.yieldrawset` | 单轮 | 候选去重 |
+
+composition 结束时，`update_notifier` 会清理单字模式、剩余辅码、转换结果和 `preedit_prefix_cache`。
